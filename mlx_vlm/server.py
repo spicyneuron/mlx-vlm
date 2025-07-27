@@ -1,4 +1,5 @@
 import asyncio
+import argparse
 import codecs
 import gc
 import json
@@ -1110,11 +1111,46 @@ async def unload_model_endpoint():
     }
 
 
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description="Run MLX-VLM inference server with FastAPI."
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Port to run the server on (default: 8000).",
+    )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default="127.0.0.1",
+        help="Host to bind the server to (default: 127.0.0.1).",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of worker processes (default: 1).",
+    )
+    parser.add_argument(
+        "--reload",
+        action="store_true",
+        help="Enable auto-reload for development (default: False).",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_arguments()
 
     uvicorn.run(
-        "mlx_vlm.server:app", host="0.0.0.0", port=8000, workers=1, reload=True
-    )  # reload=True for development to automatically restart on code changes.
+        "mlx_vlm.server:app",
+        host=args.host,
+        port=args.port,
+        workers=args.workers,
+        reload=args.reload
+    )
 
 
 if __name__ == "__main__":
