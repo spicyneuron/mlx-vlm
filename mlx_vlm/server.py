@@ -346,6 +346,7 @@ StreamEvent = Union[
 
 # OpenAI endpoint
 @app.post("/responses")
+@app.post("/v1/chat/completions")
 async def openai_endpoint(request: Request):
     """
     OpenAI-compatible endpoint for generating text based on a prompt and optional images.
