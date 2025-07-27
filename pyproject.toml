@@ -7,7 +7,7 @@ name = "mlx-vlm"
 dynamic = ["version", "dependencies"]
 description = "MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VLMs) and Omni Models (VLMs with audio and video support) on your Mac using MLX."
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 license = {text = "MIT"}
 authors = [
     {name = "Prince Canuma", email = "prince.gdt@gmail.com"},
@@ -17,7 +17,6 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -43,7 +42,7 @@ version = {attr = "mlx_vlm.version.__version__"}
 dependencies = {file = ["requirements.txt"]}
 
 [project.optional-dependencies]
-ui = ["gradio>=5.19.0"]
+ui = ["gradio"]
 audio = ["mlx-audio"]
 torch = ["torch", "torchvision", "einops", "blobfile", "tiktoken"]
 
