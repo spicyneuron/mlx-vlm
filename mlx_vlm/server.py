@@ -1,5 +1,4 @@
 import asyncio
-import codecs
 import gc
 import json
 import traceback
@@ -346,6 +345,8 @@ StreamEvent = Union[
 
 # OpenAI endpoint
 @app.post("/responses")
+@app.post("/chat/completions")
+@app.post("/v1/chat/completions")
 async def openai_endpoint(request: Request):
     """
     OpenAI-compatible endpoint for generating text based on a prompt and optional images.
@@ -778,7 +779,6 @@ async def generate_endpoint(request: GenerationRequest):
     but for now, we just copy the logic from generate.py to avoid merging issues.
     """
     try:
-
         # Get model, processor, config - loading if necessary
         model, processor, config = get_cached_model(request.model, request.adapter_path)
 
@@ -1104,13 +1104,12 @@ async def unload_model_endpoint():
 
     return {
         "status": "success",
-        "message": f"Model unloaded successfully",
+        "message": "Model unloaded successfully",
         "unloaded": unloaded_info,
     }
 
 
 def main():
-
     uvicorn.run(
         "mlx_vlm.server:app", host="0.0.0.0", port=8000, workers=1, reload=True
     )  # reload=True for development to automatically restart on code changes.
