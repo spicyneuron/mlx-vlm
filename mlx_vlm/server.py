@@ -113,7 +113,7 @@ def unload_model_sync():
     return True
 
 
-# OpenAI API Models
+# OpenAI Responses API Models
 
 
 class ResponseInputTextParam(TypedDict, total=False):
@@ -255,6 +255,97 @@ class OpenAIResponse(BaseModel):
     )
 
 
+# OpenAI Chat Completions API Models
+
+
+class ChatCompletionMessageContentText(BaseModel):
+    type: Literal["text"] = "text"
+    text: str
+
+
+class ChatCompletionMessageContentImageUrl(BaseModel):
+    url: str
+    detail: Optional[Literal["auto", "low", "high"]] = "auto"
+
+
+class ChatCompletionMessageContentImage(BaseModel):
+    type: Literal["image_url"] = "image_url"
+    image_url: ChatCompletionMessageContentImageUrl
+
+
+ChatCompletionMessageContentPart = Union[
+    ChatCompletionMessageContentText, ChatCompletionMessageContentImage
+]
+
+
+class ChatCompletionMessage(BaseModel):
+    role: Literal["system", "user", "assistant"] = Field(
+        ..., description="The role of the message sender"
+    )
+    content: Union[str, List[ChatCompletionMessageContentPart]] = Field(
+        ..., description="The content of the message"
+    )
+
+
+class ChatCompletionRequest(BaseModel):
+    messages: List[ChatCompletionMessage] = Field(
+        ..., description="A list of messages comprising the conversation so far"
+    )
+    model: str = Field(..., description="ID of the model to use")
+    max_tokens: Optional[int] = Field(
+        DEFAULT_MAX_TOKENS, description="The maximum number of tokens to generate"
+    )
+    temperature: Optional[float] = Field(
+        DEFAULT_TEMPERATURE, ge=0, le=2, description="Sampling temperature"
+    )
+    top_p: Optional[float] = Field(
+        DEFAULT_TOP_P, ge=0, le=1, description="Nucleus sampling parameter"
+    )
+    stream: Optional[bool] = Field(
+        False, description="Whether to stream partial message deltas"
+    )
+
+
+class ChatCompletionUsage(BaseModel):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+
+class ChatCompletionResponseChoice(BaseModel):
+    index: int = 0
+    message: ChatCompletionMessage
+    finish_reason: Optional[Literal["stop", "length"]] = "stop"
+
+
+class ChatCompletionResponse(BaseModel):
+    id: str
+    object: Literal["chat.completion"] = "chat.completion"
+    created: int
+    model: str
+    choices: List[ChatCompletionResponseChoice]
+    usage: ChatCompletionUsage
+
+
+class ChatCompletionChunkDelta(BaseModel):
+    role: Optional[str] = None
+    content: Optional[str] = None
+
+
+class ChatCompletionChunkChoice(BaseModel):
+    index: int = 0
+    delta: ChatCompletionChunkDelta
+    finish_reason: Optional[Literal["stop", "length"]] = None
+
+
+class ChatCompletionChunk(BaseModel):
+    id: str
+    object: Literal["chat.completion.chunk"] = "chat.completion.chunk"
+    created: int
+    model: str
+    choices: List[ChatCompletionChunkChoice]
+
+
 class BaseStreamEvent(BaseModel):
     type: str
 
@@ -345,74 +436,91 @@ StreamEvent = Union[
 ]
 
 
-# OpenAI endpoint
+# Shared completion logic
+async def _generate_completion(
+    model_path: str,
+    chat_messages: List[dict],
+    images: List[str],
+    temperature: float,
+    max_tokens: int,
+    top_p: float,
+    stream: bool = False,
+    adapter_path: Optional[str] = None,
+):
+    """Shared completion logic that both endpoints can use."""
+    # Get model, processor, config - loading if necessary
+    model, processor, config = get_cached_model(model_path, adapter_path)
+
+    # Apply chat template
+    formatted_prompt = apply_chat_template(
+        processor, config, chat_messages, num_images=len(images)
+    )
+
+    if stream:
+        # Return streaming generator
+        return stream_generate(
+            model=model,
+            processor=processor,
+            prompt=formatted_prompt,
+            image=images,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+        )
+    else:
+        # Return generation result
+        result = generate(
+            model=model,
+            processor=processor,
+            prompt=formatted_prompt,
+            image=images,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            verbose=False,
+        )
+        # Clean up resources
+        mx.clear_cache()
+        gc.collect()
+        return result
+
+
+# OpenAI Responses API endpoint
 @app.post("/responses")
-@app.post("/chat/completions")
-@app.post("/v1/chat/completions")
 async def openai_endpoint(request: Request):
     """
-    OpenAI-compatible endpoint for generating text based on a prompt and optional images.
+    OpenAI Responses API endpoint for generating text based on a prompt and optional images.
 
-    using client.responses.create method.
+    This endpoint supports the OpenAI Responses API format (used by client.responses.create).
+    For standard Chat Completions API, use /v1/chat/completions endpoint instead.
 
-    example:
+    Example usage:
 
     from openai import OpenAI
 
-    API_URL = "http://0.0.0.0:8000"
-    API_KEY = 'any'
+    client = OpenAI(base_url="http://localhost:8000", api_key="dummy")
 
-    def run_openai(prompt, img_url,system, stream=False, max_output_tokens=512, model="mlx-community/Qwen2.5-VL-3B-Instruct-8bit"):
-        ''' Calls the OpenAI API
-        '''
-
-        client = OpenAI(base_url=f"{API_URL}", api_key=API_KEY)
-
-        try :
-            response = client.responses.create(
-                model=model,
-                input=[
-                    {"role":"system",
-                    "content": f"{system}"
-                    },
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "input_text", "text": prompt},
-                            {"type": "input_image", "image_url": f"{img_url}"},
-                        ],
-                    }
+    response = client.responses.create(
+        model="your-model-path",
+        input=[
+            {"role": "system", "content": "You are a helpful assistant."},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "What's in this image?"},
+                    {"type": "input_image", "image_url": "https://example.com/image.jpg"},
                 ],
-                max_output_tokens=max_output_tokens,
-                stream=stream
-            )
-            if not stream:
-                print(response.output[0].content[0].text)
-                print(response.usage)
-            else:
-                for event in response:
-                    # Process different event types if needed
-                    if hasattr(event, 'delta') and event.delta:
-                        print(event.delta, end="", flush=True)
-                    elif event.type == 'response.completed':
-                        print("\n--- Usage ---")
-                        print(event.response.usage)
-
-        except Exception as e:
-            # building a response object to match the one returned when request is successful so that it can be processed in the same way
-            return {"model - error":str(e),"content":{}, "model":model}
-
+            }
+        ],
+        max_output_tokens=512,
+        stream=False
+    )
     """
 
     body = await request.json()
     openai_request = OpenAIRequest(**body)
 
     try:
-        # Get model, processor, config - loading if necessary
-        model, processor, config = get_cached_model(openai_request.model)
-
-        kwargs = {}
-
         chat_messages = []
         images = []
         instructions = None
@@ -480,10 +588,6 @@ async def openai_endpoint(request: Request):
             print("no input")
             raise HTTPException(status_code=400, detail="Missing input.")
 
-        formatted_prompt = apply_chat_template(
-            processor, config, chat_messages, num_images=len(images)
-        )
-
         generated_at = datetime.now().timestamp()
         response_id = f"resp_{uuid.uuid4().hex}"
         message_id = f"msg_{uuid.uuid4().hex}"
@@ -535,16 +639,15 @@ async def openai_endpoint(request: Request):
                     )
                     yield f"event: response.content_part.added\ndata: {ResponseContentPartAddedEvent(type='response.content_part.added', item_id=message_id, output_index=0, content_index=0, part=content_part).model_dump_json()}\n\n"
 
-                    # Stream text deltas
-                    token_iterator = stream_generate(
-                        model=model,
-                        processor=processor,
-                        prompt=formatted_prompt,
-                        image=images,
+                    # Stream text deltas using shared helper
+                    token_iterator = await _generate_completion(
+                        model_path=openai_request.model,
+                        chat_messages=chat_messages,
+                        images=images,
                         temperature=openai_request.temperature,
                         max_tokens=openai_request.max_output_tokens,
                         top_p=openai_request.top_p,
-                        **kwargs,
+                        stream=True,
                     )
 
                     full_text = ""
@@ -614,21 +717,15 @@ async def openai_endpoint(request: Request):
         else:
             # Non-streaming response
             try:
-                # Use generate from generate.py
-                result = generate(
-                    model=model,
-                    processor=processor,
-                    prompt=formatted_prompt,
-                    image=images,
+                result = await _generate_completion(
+                    model_path=openai_request.model,
+                    chat_messages=chat_messages,
+                    images=images,
                     temperature=openai_request.temperature,
                     max_tokens=openai_request.max_output_tokens,
                     top_p=openai_request.top_p,
-                    verbose=False,  # stats are passed in the response
-                    **kwargs,
+                    stream=False,
                 )
-                # Clean up resources
-                mx.clear_cache()
-                gc.collect()
                 print("Generation finished, cleared cache.")
 
                 response = OpenAIResponse(
@@ -680,6 +777,141 @@ async def openai_endpoint(request: Request):
         raise HTTPException(
             status_code=500, detail=f"An unexpected error occurred: {e}"
         )
+
+
+# Chat Completions API endpoint
+@app.post("/v1/chat/completions", name="chat_completions")
+async def chat_completions_endpoint(request: ChatCompletionRequest):
+    """OpenAI Chat Completions API compatible endpoint."""
+    try:
+        # Parse messages and extract images
+        chat_messages = []
+        images = []
+
+        for message in request.messages:
+            if isinstance(message.content, str):
+                chat_messages.append({"role": message.role, "content": message.content})
+            elif isinstance(message.content, list):
+                text_parts = []
+                for part in message.content:
+                    if part.type == "text":
+                        text_parts.append(part.text)
+                    elif part.type == "image_url":
+                        images.append(part.image_url.url)
+                if text_parts:
+                    combined_text = " ".join(text_parts)
+                    chat_messages.append(
+                        {"role": message.role, "content": combined_text}
+                    )
+
+        # Generate response metadata
+        created_at = int(datetime.now().timestamp())
+        completion_id = f"chatcmpl-{uuid.uuid4().hex[:10]}"
+
+        if request.stream:
+
+            async def stream_generator():
+                try:
+                    # Send initial chunk
+                    initial_chunk = ChatCompletionChunk(
+                        id=completion_id,
+                        created=created_at,
+                        model=request.model,
+                        choices=[
+                            ChatCompletionChunkChoice(
+                                delta=ChatCompletionChunkDelta(
+                                    role="assistant", content=""
+                                )
+                            )
+                        ],
+                    )
+                    yield f"data: {initial_chunk.model_dump_json()}\n\n"
+
+                    # Get streaming results using shared helper
+                    token_iterator = await _generate_completion(
+                        model_path=request.model,
+                        chat_messages=chat_messages,
+                        images=images,
+                        temperature=request.temperature or DEFAULT_TEMPERATURE,
+                        max_tokens=request.max_tokens or DEFAULT_MAX_TOKENS,
+                        top_p=request.top_p or DEFAULT_TOP_P,
+                        stream=True,
+                    )
+
+                    for chunk in token_iterator:
+                        if chunk is None or not hasattr(chunk, "text"):
+                            continue
+                        chunk_response = ChatCompletionChunk(
+                            id=completion_id,
+                            created=created_at,
+                            model=request.model,
+                            choices=[
+                                ChatCompletionChunkChoice(
+                                    delta=ChatCompletionChunkDelta(content=chunk.text)
+                                )
+                            ],
+                        )
+                        yield f"data: {chunk_response.model_dump_json()}\n\n"
+                        await asyncio.sleep(0.01)
+
+                    # Send final chunk
+                    final_chunk = ChatCompletionChunk(
+                        id=completion_id,
+                        created=created_at,
+                        model=request.model,
+                        choices=[
+                            ChatCompletionChunkChoice(
+                                delta=ChatCompletionChunkDelta(), finish_reason="stop"
+                            )
+                        ],
+                    )
+                    yield f"data: {final_chunk.model_dump_json()}\n\n"
+                    yield "data: [DONE]\n\n"
+                except Exception as e:
+                    print(f"Error during stream generation: {e}")
+                    traceback.print_exc()
+                    yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                finally:
+                    mx.clear_cache()
+                    gc.collect()
+
+            return StreamingResponse(stream_generator(), media_type="text/event-stream")
+        else:
+            # Non-streaming response using shared helper
+            result = await _generate_completion(
+                model_path=request.model,
+                chat_messages=chat_messages,
+                images=images,
+                temperature=request.temperature or DEFAULT_TEMPERATURE,
+                max_tokens=request.max_tokens or DEFAULT_MAX_TOKENS,
+                top_p=request.top_p or DEFAULT_TOP_P,
+                stream=False,
+            )
+
+            response = ChatCompletionResponse(
+                id=completion_id,
+                created=created_at,
+                model=request.model,
+                choices=[
+                    ChatCompletionResponseChoice(
+                        message=ChatCompletionMessage(
+                            role="assistant", content=result.text
+                        )
+                    )
+                ],
+                usage=ChatCompletionUsage(
+                    prompt_tokens=result.prompt_tokens,
+                    completion_tokens=result.generation_tokens,
+                    total_tokens=result.total_tokens,
+                ),
+            )
+            return response
+    except Exception as e:
+        print(f"Error in chat completions endpoint: {e}")
+        traceback.print_exc()
+        mx.clear_cache()
+        gc.collect()
+        raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
 
 
 # MLX_VLM Models
@@ -928,7 +1160,7 @@ async def generate_endpoint(request: GenerationRequest):
 @app.post(
     "/chat", response_model=None
 )  # Response model handled dynamically based on stream flag
-async def generate_endpoint(request: GenerationRequest):
+async def chat_endpoint(request: GenerationRequest):
     """
     Generate text based on a prompt and optional images.
     Prompt must be a list of chat messages, including system, user, and assistant messages.
@@ -1114,38 +1346,35 @@ async def unload_model_endpoint():
 def main():
     parser = argparse.ArgumentParser(description="MLX-VLM Inference Server")
     parser.add_argument(
-        "--host", 
-        type=str, 
-        default=os.getenv("MLX_VLM_HOST", "127.0.0.1"), 
-        help="Host to bind the server to (default: 127.0.0.1, env: MLX_VLM_HOST)"
+        "--host",
+        type=str,
+        default=os.getenv("MLX_VLM_HOST", "127.0.0.1"),
+        help="Host to bind the server to (default: 127.0.0.1, env: MLX_VLM_HOST)",
     )
     parser.add_argument(
-        "--port", 
-        type=int, 
-        default=int(os.getenv("MLX_VLM_PORT", "8000")), 
-        help="Port to bind the server to (default: 8000, env: MLX_VLM_PORT)"
+        "--port",
+        type=int,
+        default=int(os.getenv("MLX_VLM_PORT", "8000")),
+        help="Port to bind the server to (default: 8000, env: MLX_VLM_PORT)",
     )
     parser.add_argument(
-        "--workers", 
-        type=int, 
-        default=1, 
-        help="Number of worker processes (default: 1)"
+        "--workers", type=int, default=1, help="Number of worker processes (default: 1)"
     )
     parser.add_argument(
-        "--reload", 
-        action="store_true", 
-        default=False, 
-        help="Enable auto-reload for development"
+        "--reload",
+        action="store_true",
+        default=False,
+        help="Enable auto-reload for development",
     )
-    
+
     args = parser.parse_args()
-    
+
     uvicorn.run(
-        "mlx_vlm.server:app", 
-        host=args.host, 
-        port=args.port, 
-        workers=args.workers, 
-        reload=args.reload
+        "mlx_vlm.server:app",
+        host=args.host,
+        port=args.port,
+        workers=args.workers,
+        reload=args.reload,
     )
 
 
