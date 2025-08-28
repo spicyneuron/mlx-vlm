@@ -6,7 +6,7 @@ import logging
 import uuid
 from typing import List
 
-from mlx_lm.server import APIHandler, ModelProvider, run
+from mlx_lm.server import APIHandler, ModelProvider, run, process_message_content, convert_chat
 from mlx_vlm.generate import generate, stream_generate
 from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.utils import load
@@ -50,14 +50,18 @@ class VLMModelProvider(ModelProvider):
         else:
             model_path_actual = model_path
 
-        # Try VLM loading first
-        model, processor = load(
-            model_path_actual, adapter_path=adapter_path, trust_remote_code=True
-        )
-        self.model_key = (model_path, adapter_path, draft_model_path)
-        self.model = model
-        self.tokenizer = processor  # For VLM models, processor acts as tokenizer
-        return self.model, self.tokenizer
+        # Try VLM loading first, fallback to mlx-lm for text-only models
+        try:
+            model, processor = load(
+                model_path_actual, adapter_path=adapter_path, trust_remote_code=True
+            )
+            self.model_key = (model_path, adapter_path, draft_model_path)
+            self.model = model
+            self.tokenizer = processor  # For VLM models, processor acts as tokenizer
+            return self.model, self.tokenizer
+        except Exception:
+            # Fallback to standard mlx-lm loading for text-only models
+            return super().load(model_path, adapter_path, draft_model_path)
 
 
 class VLMAPIHandler(APIHandler):
@@ -144,8 +148,6 @@ class VLMAPIHandler(APIHandler):
         # Fallback to original mlx-lm processing for text-only
         if hasattr(self.tokenizer, "chat_template") and self.tokenizer.chat_template:
             # Use original message processing from parent class, but with processed messages (images removed)
-            from mlx_lm.server import process_message_content
-
             process_message_content(messages)  # Use processed messages, not original body["messages"]
             prompt = self.tokenizer.apply_chat_template(
                 messages,  # Use processed messages, not original body["messages"]
@@ -154,8 +156,6 @@ class VLMAPIHandler(APIHandler):
                 **self.model_provider.cli_args.chat_template_args,
             )
         else:
-            from mlx_lm.server import convert_chat
-
             prompt = convert_chat(messages, body.get("role_mapping"))  # Use processed messages
             prompt = self.tokenizer.encode(prompt)
 
