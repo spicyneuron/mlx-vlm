@@ -1,6 +1,8 @@
+import argparse
 import asyncio
 import gc
 import json
+import os
 import traceback
 import uuid
 from datetime import datetime
@@ -1110,9 +1112,41 @@ async def unload_model_endpoint():
 
 
 def main():
+    parser = argparse.ArgumentParser(description="MLX-VLM Inference Server")
+    parser.add_argument(
+        "--host", 
+        type=str, 
+        default=os.getenv("MLX_VLM_HOST", "127.0.0.1"), 
+        help="Host to bind the server to (default: 127.0.0.1, env: MLX_VLM_HOST)"
+    )
+    parser.add_argument(
+        "--port", 
+        type=int, 
+        default=int(os.getenv("MLX_VLM_PORT", "8000")), 
+        help="Port to bind the server to (default: 8000, env: MLX_VLM_PORT)"
+    )
+    parser.add_argument(
+        "--workers", 
+        type=int, 
+        default=1, 
+        help="Number of worker processes (default: 1)"
+    )
+    parser.add_argument(
+        "--reload", 
+        action="store_true", 
+        default=False, 
+        help="Enable auto-reload for development"
+    )
+    
+    args = parser.parse_args()
+    
     uvicorn.run(
-        "mlx_vlm.server:app", host="0.0.0.0", port=8000, workers=1, reload=True
-    )  # reload=True for development to automatically restart on code changes.
+        "mlx_vlm.server:app", 
+        host=args.host, 
+        port=args.port, 
+        workers=args.workers, 
+        reload=args.reload
+    )
 
 
 if __name__ == "__main__":
