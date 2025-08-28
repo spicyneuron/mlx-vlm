@@ -14,6 +14,10 @@ from mlx_vlm.utils import load
 
 class VLMModelProvider(ModelProvider):
     """Extended ModelProvider that can load both text-only and vision-language models."""
+    
+    def __init__(self, cli_args):
+        super().__init__(cli_args)
+        self.default_model_map = {}  # Initialize empty model mapping
 
     def load(self, model_path, adapter_path=None, draft_model_path=None):
         """
@@ -44,29 +48,16 @@ class VLMModelProvider(ModelProvider):
                 )
             model_path_actual = self.cli_args.model
         else:
-            try:
-                self._validate_model_path(model_path)
-                model_path_actual = model_path
-            except Exception:
-                raise
+            model_path_actual = model_path
 
-        try:
-            # Try VLM loading first
-            model, processor = load(
-                model_path_actual, adapter_path=adapter_path, trust_remote_code=True
-            )
-            self.model_key = (model_path, adapter_path, draft_model_path)
-            self.model = model
-            self.tokenizer = processor  # For VLM models, processor acts as tokenizer
-            return self.model, self.tokenizer
-
-        except Exception:
-            # Fallback to mlx-lm loading for text-only models
-            try:
-                result = super().load(model_path, adapter_path, draft_model_path)
-                return result
-            except Exception:
-                raise
+        # Try VLM loading first
+        model, processor = load(
+            model_path_actual, adapter_path=adapter_path, trust_remote_code=True
+        )
+        self.model_key = (model_path, adapter_path, draft_model_path)
+        self.model = model
+        self.tokenizer = processor  # For VLM models, processor acts as tokenizer
+        return self.model, self.tokenizer
 
 
 class VLMAPIHandler(APIHandler):
@@ -74,6 +65,7 @@ class VLMAPIHandler(APIHandler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        
 
     def extract_images_from_messages(self, messages: List[dict]) -> tuple:
         """
@@ -136,7 +128,7 @@ class VLMAPIHandler(APIHandler):
         )
 
         if has_vision_support and images:
-            # Use VLM-specific chat template and tokenization
+            # Use VLM-specific chat template and return the formatted string
             try:
                 formatted_prompt = apply_chat_template(
                     self.tokenizer,
@@ -144,19 +136,19 @@ class VLMAPIHandler(APIHandler):
                     messages,
                     num_images=len(images),
                 )
-                return self.tokenizer.encode(formatted_prompt, add_special_tokens=False)
+                return formatted_prompt  # Return the string directly for VLM processing
             except Exception:
                 # Fallback to standard processing if VLM chat template fails
                 pass
 
         # Fallback to original mlx-lm processing for text-only
         if hasattr(self.tokenizer, "chat_template") and self.tokenizer.chat_template:
-            # Use original message processing from parent class
+            # Use original message processing from parent class, but with processed messages (images removed)
             from mlx_lm.server import process_message_content
 
-            process_message_content(body["messages"])
+            process_message_content(messages)  # Use processed messages, not original body["messages"]
             prompt = self.tokenizer.apply_chat_template(
-                body["messages"],
+                messages,  # Use processed messages, not original body["messages"]
                 body.get("tools") or None,
                 add_generation_prompt=True,
                 **self.model_provider.cli_args.chat_template_args,
@@ -164,7 +156,7 @@ class VLMAPIHandler(APIHandler):
         else:
             from mlx_lm.server import convert_chat
 
-            prompt = convert_chat(body["messages"], body.get("role_mapping"))
+            prompt = convert_chat(messages, body.get("role_mapping"))  # Use processed messages
             prompt = self.tokenizer.encode(prompt)
 
         return prompt
@@ -189,7 +181,11 @@ class VLMAPIHandler(APIHandler):
                 self.end_headers()
 
             # Convert prompt back to text for VLM processing
-            if hasattr(self.tokenizer, "decode"):
+            if isinstance(prompt, str):
+                # Prompt is already a string (from VLM chat template)
+                prompt_text = prompt
+            elif hasattr(self.tokenizer, "decode"):
+                # Prompt is token IDs, need to decode
                 prompt_text = self.tokenizer.decode(prompt)
             else:
                 # Fallback if decode not available
@@ -367,7 +363,7 @@ def main():
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
 
-    print("MLX-VLM Extended Server (multimodal support enabled)")
+    print("MLX-VLM Extended Server (multimodal support enabled)", flush=True)
 
     # Use the extended classes with mlx-lm's run function
     run(args.host, args.port, VLMModelProvider(args), handler_class=VLMAPIHandler)
