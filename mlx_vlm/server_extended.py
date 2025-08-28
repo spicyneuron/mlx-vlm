@@ -140,7 +140,10 @@ class VLMAPIHandler(APIHandler):
                     messages,
                     num_images=len(images),
                 )
-                return formatted_prompt  # Return the string directly for VLM processing
+                # Store the formatted prompt text for VLM processing
+                self._vlm_formatted_prompt = formatted_prompt
+                # Tokenize the formatted prompt to maintain consistency with parent class
+                return self.tokenizer.encode(formatted_prompt)
             except Exception:
                 # Fallback to standard processing if VLM chat template fails
                 pass
@@ -180,8 +183,10 @@ class VLMAPIHandler(APIHandler):
             if self.stream:
                 self.end_headers()
 
-            # Convert prompt back to text for VLM processing
-            if isinstance(prompt, str):
+            # Use stored VLM-formatted prompt if available, otherwise decode
+            if hasattr(self, '_vlm_formatted_prompt'):
+                prompt_text = self._vlm_formatted_prompt
+            elif isinstance(prompt, str):
                 # Prompt is already a string (from VLM chat template)
                 prompt_text = prompt
             elif hasattr(self.tokenizer, "decode"):
