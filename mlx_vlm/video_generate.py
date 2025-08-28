@@ -1,19 +1,15 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import logging
 import math
 import os
-import sys
 import time
-from io import BytesIO
 from typing import List
 
 import cv2
 import mlx.core as mx
 import numpy as np
-import requests
 from PIL import Image
 
 from .generate import generate
@@ -109,29 +105,11 @@ def fetch_image(
     ele: dict[str, str | Image.Image], size_factor: int = IMAGE_FACTOR
 ) -> Image.Image:
     if "image" in ele:
-        image = ele["image"]
+        image_source = ele["image"]
     else:
-        image = ele["image_url"]
-    image_obj = None
-    if isinstance(image, Image.Image):
-        image_obj = image
-    elif image.startswith("http://") or image.startswith("https://"):
-        response = requests.get(image, stream=True)
-        image_obj = Image.open(BytesIO(response.content))
-    elif image.startswith("file://"):
-        image_obj = Image.open(image[7:])
-    elif image.startswith("data:image"):
-        if "base64," in image:
-            _, base64_data = image.split("base64,", 1)
-            data = base64.b64decode(base64_data)
-            image_obj = Image.open(BytesIO(data))
-    else:
-        image_obj = Image.open(image)
-    if image_obj is None:
-        raise ValueError(
-            f"Unrecognized image input, support local path, http url, base64 and PIL.Image, got {image}"
-        )
-    image = to_rgb(image_obj)
+        image_source = ele["image_url"]
+
+    image = load_image(image_source)
     ## resize
     if "resized_height" in ele and "resized_width" in ele:
         resized_height, resized_width = smart_resize(
@@ -163,9 +141,9 @@ def smart_nframes(
 
     Either a fixed 'nframes' is provided in ele or 'fps' is used to calculate how many frames to sample.
     """
-    assert not (
-        "fps" in ele and "nframes" in ele
-    ), "Only accept either `fps` or `nframes`"
+    assert not ("fps" in ele and "nframes" in ele), (
+        "Only accept either `fps` or `nframes`"
+    )
     if "nframes" in ele:
         nframes = round_by_factor(ele["nframes"], FRAME_FACTOR)
     else:
@@ -207,7 +185,7 @@ def load_video(
     video_fps = cap.get(cv2.CAP_PROP_FPS) or 1.0  # default to 1.0 if fps returns 0
     st = time.time()
     logger.info(
-        f"numpy reader: video_path={video_path}, total_frames={total_frames}, video_fps={video_fps}, time={time.time()-st:.3f}s"
+        f"numpy reader: video_path={video_path}, total_frames={total_frames}, video_fps={video_fps}, time={time.time() - st:.3f}s"
     )
     nframes = smart_nframes(ele, total_frames=total_frames, video_fps=video_fps)
     indices = np.linspace(0, total_frames - 1, nframes).round().astype(int)
@@ -474,7 +452,6 @@ def main():
 
     kwargs = {}
     if is_video_model(model):
-
         # Check if video is image or video
         if is_video_file(args.video):
             messages = [

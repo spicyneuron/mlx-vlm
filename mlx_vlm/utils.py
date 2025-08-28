@@ -1,3 +1,4 @@
+import base64
 import copy
 import glob
 import importlib
@@ -583,28 +584,76 @@ def save_config(
 
 def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
     """
-    Helper function to load an image from either a URL or file.
+    Helper function to load an image from either a URL, file, or base64 data URI.
+    Supports:
+    - Local file paths
+    - HTTP/HTTPS URLs  
+    - Base64 data URIs (data:image/*;base64,<data>)
+    - BytesIO objects
+    - PIL Image objects
     """
-    if isinstance(image_source, BytesIO) or Path(image_source).is_file():
-        # for base64 encoded images
+    if isinstance(image_source, Image.Image):
+        image = image_source
+    elif isinstance(image_source, BytesIO):
+        try:
+            image = Image.open(image_source)
+        except IOError as e:
+            raise ValueError(
+                f"Failed to load image from BytesIO with error: {e}"
+            ) from e
+    elif isinstance(image_source, str):
+        if image_source.startswith("data:image"):
+            # Handle base64 data URIs
+            if "base64," in image_source:
+                try:
+                    _, base64_data = image_source.split("base64,", 1)
+                    data = base64.b64decode(base64_data)
+                    image = Image.open(BytesIO(data))
+                except Exception as e:
+                    raise ValueError(
+                        f"Failed to decode base64 image data with error: {e}"
+                    ) from e
+            else:
+                raise ValueError(
+                    "Base64 data URI must contain 'base64,' separator"
+                )
+        elif image_source.startswith(("http://", "https://")):
+            try:
+                response = requests.get(image_source, stream=True, timeout=timeout)
+                response.raise_for_status()
+                image = Image.open(response.raw)
+            except Exception as e:
+                raise ValueError(
+                    f"Failed to load image from URL: {image_source} with error {e}"
+                ) from e
+        elif image_source.startswith("file://"):
+            # Handle file:// URLs
+            try:
+                file_path = image_source[7:]  # Remove 'file://' prefix
+                image = Image.open(file_path)
+            except Exception as e:
+                raise ValueError(
+                    f"Failed to load image from file URL: {image_source} with error {e}"
+                ) from e
+        else:
+            # Try as local file path
+            try:
+                image = Image.open(image_source)
+            except Exception as e:
+                raise ValueError(
+                    f"Failed to load image from path: {image_source}. Supported formats: local path, HTTP/HTTPS URL, base64 data URI, or PIL Image. Error: {e}"
+                ) from e
+    elif isinstance(image_source, Path) or Path(str(image_source)).is_file():
+        # Handle Path objects and valid file paths
         try:
             image = Image.open(image_source)
         except IOError as e:
             raise ValueError(
                 f"Failed to load image from {image_source} with error: {e}"
             ) from e
-    elif image_source.startswith(("http://", "https://")):
-        try:
-            response = requests.get(image_source, stream=True, timeout=timeout)
-            response.raise_for_status()
-            image = Image.open(response.raw)
-        except Exception as e:
-            raise ValueError(
-                f"Failed to load image from URL: {image_source} with error {e}"
-            ) from e
     else:
         raise ValueError(
-            f"The image {image_source} must be a valid URL or existing file."
+            f"Unsupported image source type: {type(image_source)}. Expected str, Path, BytesIO, or PIL Image."
         )
 
     image = ImageOps.exif_transpose(image)
