@@ -6,7 +6,7 @@ import os
 import traceback
 import uuid
 from datetime import datetime
-from typing import Any, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import mlx.core as mx
 import uvicorn
@@ -17,15 +17,12 @@ from pydantic import BaseModel, ConfigDict, Field
 from typing_extensions import Required, TypeAlias, TypedDict
 
 from .generate import (
-    DEFAULT_MAX_TOKENS,
     DEFAULT_MODEL_PATH,
     DEFAULT_SEED,
-    DEFAULT_TEMPERATURE,
-    DEFAULT_TOP_P,
     generate,
     stream_generate,
 )
-from .prompt_utils import apply_chat_template
+from .prompt_utils import apply_chat_template, build_chat_template_kwargs
 from .utils import load
 from .version import __version__
 
@@ -40,6 +37,82 @@ MAX_IMAGES = 10  # Maximum number of images to process at once
 # Loading/unloading utilities
 
 model_cache = {}
+DEFAULT_TOP_K = 0
+DEFAULT_MIN_P = 0.0
+SERVER_DEFAULT_MAX_TOKENS = 512
+SERVER_DEFAULT_TEMPERATURE = 0.0
+SERVER_DEFAULT_TOP_P = 1.0
+
+server_defaults = {
+    "model": DEFAULT_MODEL_PATH,
+    "max_tokens": SERVER_DEFAULT_MAX_TOKENS,
+    "temperature": SERVER_DEFAULT_TEMPERATURE,
+    "top_p": SERVER_DEFAULT_TOP_P,
+    "top_k": DEFAULT_TOP_K,
+    "min_p": DEFAULT_MIN_P,
+    "chat_template": None,
+    "chat_template_args": {},
+    "use_default_chat_template": False,
+}
+
+
+def _default_model() -> str:
+    return server_defaults["model"]
+
+
+def _default_max_tokens() -> int:
+    return server_defaults["max_tokens"]
+
+
+def _default_temperature() -> float:
+    return server_defaults["temperature"]
+
+
+def _default_top_p() -> float:
+    return server_defaults["top_p"]
+
+
+def _default_top_k() -> int:
+    return server_defaults["top_k"]
+
+
+def _default_min_p() -> float:
+    return server_defaults["min_p"]
+
+
+def _build_chat_template_kwargs(
+    request_chat_template_kwargs: Optional[Dict[str, Any]] = None,
+    request_chat_template_args: Optional[Dict[str, Any]] = None,
+    chat_template: Optional[str] = None,
+    reserved_keys: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    return build_chat_template_kwargs(
+        default_args=server_defaults["chat_template_args"],
+        request_chat_template_kwargs=request_chat_template_kwargs,
+        request_chat_template_args=request_chat_template_args,
+        chat_template=chat_template,
+        reserved_keys=reserved_keys,
+    )
+
+
+def _apply_default_chat_template(processor) -> None:
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    chat_template = server_defaults["chat_template"]
+    use_default_chat_template = server_defaults["use_default_chat_template"]
+
+    if chat_template:
+        if hasattr(tokenizer, "chat_template"):
+            tokenizer.chat_template = chat_template
+        if hasattr(processor, "chat_template"):
+            processor.chat_template = chat_template
+        return
+
+    if use_default_chat_template:
+        default_chat_template = getattr(tokenizer, "default_chat_template", None)
+        if default_chat_template and getattr(tokenizer, "chat_template", None) is None:
+            tokenizer.chat_template = default_chat_template
+            if hasattr(processor, "chat_template"):
+                processor.chat_template = default_chat_template
 
 
 class FlexibleBaseModel(BaseModel):
@@ -64,6 +137,7 @@ def load_model_resources(model_path: str, adapter_path: Optional[str]):
         model, processor = load(
             model_path, adapter_path, trust_remote_code=trust_remote_code
         )
+        _apply_default_chat_template(processor)
         config = model.config
         print("Model and processor loaded successfully.")
         return model, processor, config
@@ -216,14 +290,29 @@ class OpenAIRequest(FlexibleBaseModel):
     input: Union[str, List[ChatMessage]] = Field(
         ..., description="Input text or list of chat messages."
     )
-    model: str = Field(..., description="The model to use for generation.")
+    model: str = Field(
+        default_factory=_default_model,
+        description="The model to use for generation.",
+    )
     max_output_tokens: int = Field(
-        DEFAULT_MAX_TOKENS, description="Maximum number of tokens to generate."
+        default_factory=_default_max_tokens,
+        description="Maximum number of tokens to generate.",
     )
     temperature: float = Field(
-        DEFAULT_TEMPERATURE, description="Temperature for sampling."
+        default_factory=_default_temperature, description="Temperature for sampling."
     )
-    top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
+    top_p: float = Field(default_factory=_default_top_p, description="Top-p sampling.")
+    top_k: int = Field(default_factory=_default_top_k, description="Top-k sampling.")
+    min_p: float = Field(default_factory=_default_min_p, description="Min-p sampling.")
+    chat_template: Optional[str] = Field(
+        None, description="Optional chat template override."
+    )
+    chat_template_args: Optional[Dict[str, Any]] = Field(
+        None, description="Chat template keyword arguments."
+    )
+    chat_template_kwargs: Optional[Dict[str, Any]] = Field(
+        None, description="Alias of chat_template_args."
+    )
     stream: bool = Field(
         False, description="Whether to stream the response chunk by chunk."
     )
@@ -388,19 +477,31 @@ StreamEvent = Union[
 
 class VLMRequest(FlexibleBaseModel):
     model: str = Field(
-        DEFAULT_MODEL_PATH,
+        default_factory=_default_model,
         description="The path to the local model directory or Hugging Face repo.",
     )
     adapter_path: Optional[str] = Field(
         None, description="The path to the adapter weights."
     )
     max_tokens: int = Field(
-        DEFAULT_MAX_TOKENS, description="Maximum number of tokens to generate."
+        default_factory=_default_max_tokens,
+        description="Maximum number of tokens to generate.",
     )
     temperature: float = Field(
-        DEFAULT_TEMPERATURE, description="Temperature for sampling."
+        default_factory=_default_temperature, description="Temperature for sampling."
     )
-    top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
+    top_p: float = Field(default_factory=_default_top_p, description="Top-p sampling.")
+    top_k: int = Field(default_factory=_default_top_k, description="Top-k sampling.")
+    min_p: float = Field(default_factory=_default_min_p, description="Min-p sampling.")
+    chat_template: Optional[str] = Field(
+        None, description="Optional chat template override."
+    )
+    chat_template_args: Optional[Dict[str, Any]] = Field(
+        None, description="Chat template keyword arguments."
+    )
+    chat_template_kwargs: Optional[Dict[str, Any]] = Field(
+        None, description="Alias of chat_template_args."
+    )
     seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
     resize_shape: Optional[Tuple[int, int]] = Field(
         None,
@@ -607,8 +708,19 @@ async def responses_endpoint(request: Request):
             print("no input")
             raise HTTPException(status_code=400, detail="Missing input.")
 
+        chat_template_kwargs = _build_chat_template_kwargs(
+            request_chat_template_kwargs=openai_request.chat_template_kwargs,
+            request_chat_template_args=openai_request.chat_template_args,
+            chat_template=openai_request.chat_template,
+            reserved_keys=["num_images"],
+        )
+
         formatted_prompt = apply_chat_template(
-            processor, config, chat_messages, num_images=len(images)
+            processor,
+            config,
+            chat_messages,
+            num_images=len(images),
+            **chat_template_kwargs,
         )
 
         generated_at = datetime.now().timestamp()
@@ -671,6 +783,8 @@ async def responses_endpoint(request: Request):
                         temperature=openai_request.temperature,
                         max_tokens=openai_request.max_output_tokens,
                         top_p=openai_request.top_p,
+                        top_k=openai_request.top_k,
+                        min_p=openai_request.min_p,
                         **kwargs,
                     )
 
@@ -750,6 +864,8 @@ async def responses_endpoint(request: Request):
                     temperature=openai_request.temperature,
                     max_tokens=openai_request.max_output_tokens,
                     top_p=openai_request.top_p,
+                    top_k=openai_request.top_k,
+                    min_p=openai_request.min_p,
                     verbose=False,  # stats are passed in the response
                     **kwargs,
                 )
@@ -866,12 +982,20 @@ async def chat_completions_endpoint(request: ChatRequest):
                     {"role": message.role, "content": text_content}
                 )
 
+        chat_template_kwargs = _build_chat_template_kwargs(
+            request_chat_template_kwargs=request.chat_template_kwargs,
+            request_chat_template_args=request.chat_template_args,
+            chat_template=request.chat_template,
+            reserved_keys=["num_images", "num_audios"],
+        )
+
         formatted_prompt = apply_chat_template(
             processor,
             config,
             processed_messages,
             num_images=len(images),
             num_audios=len(audio),
+            **chat_template_kwargs,
         )
 
         if request.stream:
@@ -889,6 +1013,8 @@ async def chat_completions_endpoint(request: ChatRequest):
                         temperature=request.temperature,
                         max_tokens=request.max_tokens,
                         top_p=request.top_p,
+                        top_k=request.top_k,
+                        min_p=request.min_p,
                         **kwargs,
                     )
 
@@ -960,6 +1086,8 @@ async def chat_completions_endpoint(request: ChatRequest):
                     temperature=request.temperature,
                     max_tokens=request.max_tokens,
                     top_p=request.top_p,
+                    top_k=request.top_k,
+                    min_p=request.min_p,
                     verbose=False,  # Keep API output clean
                     **kwargs,
                 )
@@ -1079,6 +1207,12 @@ async def unload_model_endpoint():
 def main():
     parser = argparse.ArgumentParser(description="MLX VLM Http Server.")
     parser.add_argument(
+        "--model",
+        type=str,
+        default=DEFAULT_MODEL_PATH,
+        help="The path to the MLX model weights, tokenizer, and config.",
+    )
+    parser.add_argument(
         "--host",
         type=str,
         default="0.0.0.0",
@@ -1095,7 +1229,72 @@ def main():
         action="store_true",
         help="Trust remote code when loading models from Hugging Face Hub.",
     )
+    parser.add_argument(
+        "--chat-template",
+        type=str,
+        default=None,
+        help="Specify a chat template for the tokenizer.",
+    )
+    parser.add_argument(
+        "--use-default-chat-template",
+        action="store_true",
+        help="Use the tokenizer default chat template if no chat template is set.",
+    )
+    parser.add_argument(
+        "--temp",
+        type=float,
+        default=SERVER_DEFAULT_TEMPERATURE,
+        help=f"Default sampling temperature (default: {SERVER_DEFAULT_TEMPERATURE})",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=SERVER_DEFAULT_TOP_P,
+        help=f"Default nucleus sampling top-p (default: {SERVER_DEFAULT_TOP_P})",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=DEFAULT_TOP_K,
+        help=f"Default top-k sampling (default: {DEFAULT_TOP_K}, disables top-k)",
+    )
+    parser.add_argument(
+        "--min-p",
+        type=float,
+        default=DEFAULT_MIN_P,
+        help=f"Default min-p sampling (default: {DEFAULT_MIN_P}, disables min-p)",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=SERVER_DEFAULT_MAX_TOKENS,
+        help=f"Default maximum number of tokens to generate (default: {SERVER_DEFAULT_MAX_TOKENS})",
+    )
+    parser.add_argument(
+        "--chat-template-args",
+        type=json.loads,
+        default="{}",
+        help='A JSON formatted string of arguments for apply_chat_template, e.g. \'{"enable_thinking": false}\'',
+    )
     args = parser.parse_args()
+
+    if not isinstance(args.chat_template_args, dict):
+        parser.error("--chat-template-args must be a JSON object.")
+
+    server_defaults.update(
+        {
+            "model": args.model,
+            "max_tokens": args.max_tokens,
+            "temperature": args.temp,
+            "top_p": args.top_p,
+            "top_k": args.top_k,
+            "min_p": args.min_p,
+            "chat_template": args.chat_template,
+            "chat_template_args": args.chat_template_args,
+            "use_default_chat_template": args.use_default_chat_template,
+        }
+    )
+
     if args.trust_remote_code:
         os.environ["MLX_TRUST_REMOTE_CODE"] = "true"
     uvicorn.run(

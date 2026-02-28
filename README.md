@@ -162,6 +162,9 @@ Start the server:
 ```sh
 mlx_vlm.server --port 8080
 
+# Set a default model and sampler settings
+mlx_vlm.server --model mlx-community/Qwen2-VL-2B-Instruct-4bit --temp 0.0 --top-p 1.0 --top-k 0 --min-p 0.0
+
 # With trust remote code enabled (required for some models)
 mlx_vlm.server --trust-remote-code
 ```
@@ -170,6 +173,15 @@ mlx_vlm.server --trust-remote-code
 
 - `--host`: Host address (default: `0.0.0.0`)
 - `--port`: Port number (default: `8080`)
+- `--model`: Default model to use when the request omits `model`
+- `--temp`: Default temperature
+- `--top-p`: Default top-p
+- `--top-k`: Default top-k (`0` disables top-k)
+- `--min-p`: Default min-p (`0.0` disables min-p)
+- `--max-tokens`: Default max generated tokens
+- `--chat-template`: Chat template override
+- `--use-default-chat-template`: Use tokenizer default chat template if none is set
+- `--chat-template-args`: JSON args passed to `apply_chat_template`
 - `--trust-remote-code`: Trust remote code when loading models from Hugging Face Hub
 
 You can also set trust remote code via environment variable:
@@ -310,6 +322,9 @@ curl -X POST "http://localhost:8080/responses" \
 - `max_tokens`: Maximum tokens to generate
 - `temperature`: Sampling temperature
 - `top_p`: Top-p sampling parameter
+- `top_k`: Top-k sampling parameter
+- `min_p`: Min-p sampling parameter
+- `chat_template_kwargs`: Optional chat template kwargs
 - `stream`: Enable streaming responses
 
 
