@@ -1330,7 +1330,7 @@ requires-dist = [
     { name = "mlx", specifier = ">=0.30.0" },
     { name = "mlx-cpu", marker = "extra == 'cpu'" },
     { name = "mlx-cuda", marker = "extra == 'cuda'" },
-    { name = "mlx-lm", specifier = ">=0.30.5" },
+    { name = "mlx-lm", specifier = ">=0.30.7" },
     { name = "numpy" },
     { name = "opencv-python", specifier = ">=4.12.0.88" },
     { name = "pillow", specifier = ">=10.3.0" },
