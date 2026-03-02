@@ -849,7 +849,7 @@ async def responses_endpoint(request: Request):
             config,
             chat_messages,
             num_images=len(images),
-            **chat_template_kwargs,
+            chat_template_kwargs=chat_template_kwargs,
         )
 
         # Forward extra kwargs to stream_generate/generate
@@ -1160,7 +1160,7 @@ async def chat_completions_endpoint(request: ChatRequest):
             num_images=len(images),
             num_audios=len(audio),
             tools=tools,
-            **chat_template_kwargs,
+            chat_template_kwargs=chat_template_kwargs,
         )
 
         # Forward extra kwargs to stream_generate/generate
