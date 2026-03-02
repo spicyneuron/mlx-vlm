@@ -1274,6 +1274,11 @@ def main():
         default="{}",
         help='A JSON formatted string of arguments for apply_chat_template, e.g. \'{"enable_thinking": false}\'',
     )
+    parser.add_argument(
+        "--no-reload",
+        action="store_true",
+        help="Disable auto-reload and file watching.",
+    )
     args = parser.parse_args()
 
     if not isinstance(args.chat_template_args, dict):
@@ -1296,7 +1301,11 @@ def main():
     if args.trust_remote_code:
         os.environ["MLX_TRUST_REMOTE_CODE"] = "true"
     uvicorn.run(
-        "mlx_vlm.server:app", host=args.host, port=args.port, workers=1, reload=True
+        "mlx_vlm.server:app",
+        host=args.host,
+        port=args.port,
+        workers=1,
+        reload=not args.no_reload,
     )  # reload=True for development to automatically restart on code changes.
 
 
