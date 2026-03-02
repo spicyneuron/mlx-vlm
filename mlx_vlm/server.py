@@ -720,7 +720,7 @@ async def responses_endpoint(request: Request):
             config,
             chat_messages,
             num_images=len(images),
-            **chat_template_kwargs,
+            chat_template_kwargs=chat_template_kwargs,
         )
 
         generated_at = datetime.now().timestamp()
@@ -954,8 +954,6 @@ async def chat_completions_endpoint(request: ChatRequest):
                 else tuple(request.resize_shape)
             )
 
-        chat_messages = request.messages
-
         images = []
         audio = []
         processed_messages = []
@@ -995,7 +993,7 @@ async def chat_completions_endpoint(request: ChatRequest):
             processed_messages,
             num_images=len(images),
             num_audios=len(audio),
-            **chat_template_kwargs,
+            chat_template_kwargs=chat_template_kwargs,
         )
 
         if request.stream:
@@ -1199,7 +1197,7 @@ async def unload_model_endpoint():
 
     return {
         "status": "success",
-        "message": f"Model unloaded successfully",
+        "message": "Model unloaded successfully",
         "unloaded": unloaded_info,
     }
 

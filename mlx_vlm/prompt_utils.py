@@ -631,6 +631,7 @@ def apply_chat_template(
     return_messages: bool = False,
     num_images: int = 0,
     num_audios: int = 0,
+    chat_template_kwargs: Optional[Dict[str, Any]] = None,
     **kwargs,
 ) -> Union[List[Dict[str, Any]], str, Any]:
     """
@@ -644,6 +645,7 @@ def apply_chat_template(
         return_messages: Whether to return messages list instead of template
         num_images: Number of images in the input
         num_audios: Number of audio files in the input
+        chat_template_kwargs: Additional kwargs forwarded to processor.apply_chat_template
         **kwargs: Additional arguments for message formatting
 
     Returns:
@@ -730,4 +732,7 @@ def apply_chat_template(
     if model_type in ["paligemma", "molmo", "florence2"]:
         return messages[-1]
 
-    return get_chat_template(processor, messages, add_generation_prompt)
+    template_kwargs = dict(chat_template_kwargs or {})
+    return get_chat_template(
+        processor, messages, add_generation_prompt, **template_kwargs
+    )

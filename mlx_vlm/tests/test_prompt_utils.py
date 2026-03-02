@@ -363,6 +363,47 @@ class TestApplyChatTemplateIntegration:
 
         assert found_text, "Original text content was not preserved!"
 
+    def test_chat_template_kwargs_forwarded_to_template_renderer(self):
+        """chat_template_kwargs should reach processor.apply_chat_template."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        class DummyProcessor:
+            chat_template = "dummy"
+
+            def __init__(self):
+                self.captured = None
+
+            def apply_chat_template(
+                self, messages, tokenize=False, add_generation_prompt=True, **kwargs
+            ):
+                self.captured = {
+                    "messages": messages,
+                    "tokenize": tokenize,
+                    "add_generation_prompt": add_generation_prompt,
+                    "kwargs": kwargs,
+                }
+                return "ok"
+
+        processor = DummyProcessor()
+        config = {"model_type": "qwen2_vl"}
+
+        result = apply_chat_template(
+            processor,
+            config,
+            "Describe this.",
+            chat_template_kwargs={
+                "enable_thinking": True,
+                "reasoning_budget": 64,
+            },
+            dummy_format_flag=True,
+        )
+
+        assert result == "ok"
+        assert processor.captured is not None
+        assert processor.captured["kwargs"]["enable_thinking"] is True
+        assert processor.captured["kwargs"]["reasoning_budget"] == 64
+        assert "dummy_format_flag" not in processor.captured["kwargs"]
+
 
 class TestExtractTextFromContentEdgeCases:
     """Edge case tests for extract_text_from_content."""
