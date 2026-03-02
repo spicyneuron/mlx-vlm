@@ -1,6 +1,6 @@
 """Tests for prompt_utils module, specifically multimodal content handling."""
 
-from mlx_vlm.prompt_utils import extract_text_from_content
+from mlx_vlm.prompt_utils import build_chat_template_kwargs, extract_text_from_content
 
 
 class TestExtractTextFromContent:
@@ -132,6 +132,45 @@ class TestExtractTextFromContent:
         ]
         result = extract_text_from_content(content)
         assert result == "이미지에서 상품명, 가격, 설명을 추출해주세요."
+
+
+class TestBuildChatTemplateKwargs:
+    """Tests for chat template kwargs merge behavior."""
+
+    def test_merge_precedence_and_chat_template_override(self):
+        merged = build_chat_template_kwargs(
+            default_args={
+                "enable_thinking": True,
+                "chat_template": "default_template",
+            },
+            request_chat_template_args={
+                "enable_thinking": False,
+                "chat_template": "args_template",
+                "temperature": 0.7,
+            },
+            request_chat_template_kwargs={
+                "chat_template": "kwargs_template",
+                "top_p": 0.9,
+            },
+            chat_template="request_template",
+        )
+
+        assert merged["enable_thinking"] is False
+        assert merged["temperature"] == 0.7
+        assert merged["top_p"] == 0.9
+        assert merged["chat_template"] == "request_template"
+
+    def test_reserved_keys_removed_after_merge(self):
+        merged = build_chat_template_kwargs(
+            default_args={"num_images": 3, "num_audios": 2, "foo": "bar"},
+            request_chat_template_args={"num_images": 9},
+            request_chat_template_kwargs={"num_audios": 7},
+            reserved_keys=["num_images", "num_audios"],
+        )
+
+        assert "num_images" not in merged
+        assert "num_audios" not in merged
+        assert merged["foo"] == "bar"
 
 
 class TestApplyChatTemplateIntegration:
@@ -323,6 +362,47 @@ class TestApplyChatTemplateIntegration:
                 found_text = True
 
         assert found_text, "Original text content was not preserved!"
+
+    def test_chat_template_kwargs_forwarded_to_template_renderer(self):
+        """chat_template_kwargs should reach processor.apply_chat_template."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        class DummyProcessor:
+            chat_template = "dummy"
+
+            def __init__(self):
+                self.captured = None
+
+            def apply_chat_template(
+                self, messages, tokenize=False, add_generation_prompt=True, **kwargs
+            ):
+                self.captured = {
+                    "messages": messages,
+                    "tokenize": tokenize,
+                    "add_generation_prompt": add_generation_prompt,
+                    "kwargs": kwargs,
+                }
+                return "ok"
+
+        processor = DummyProcessor()
+        config = {"model_type": "qwen2_vl"}
+
+        result = apply_chat_template(
+            processor,
+            config,
+            "Describe this.",
+            chat_template_kwargs={
+                "enable_thinking": True,
+                "reasoning_budget": 64,
+            },
+            dummy_format_flag=True,
+        )
+
+        assert result == "ok"
+        assert processor.captured is not None
+        assert processor.captured["kwargs"]["enable_thinking"] is True
+        assert processor.captured["kwargs"]["reasoning_budget"] == 64
+        assert "dummy_format_flag" not in processor.captured["kwargs"]
 
 
 class TestExtractTextFromContentEdgeCases:

@@ -1,6 +1,6 @@
 from enum import Enum
 from functools import partial
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel
 
@@ -23,6 +23,29 @@ class MessageFormat(Enum):
     PROMPT_WITH_IMAGE_TOKEN = "prompt_with_image_token"
     PROMPT_WITH_START_IMAGE_TOKEN = "prompt_with_start_image_token"
     VIDEO_WITH_TEXT = "video_with_text"
+
+
+def build_chat_template_kwargs(
+    default_args: Optional[Dict[str, Any]] = None,
+    request_chat_template_kwargs: Optional[Dict[str, Any]] = None,
+    request_chat_template_args: Optional[Dict[str, Any]] = None,
+    chat_template: Optional[str] = None,
+    reserved_keys: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Merge chat template kwargs with stable precedence and reserved-key filtering."""
+    merged_kwargs = dict(default_args or {})
+
+    if request_chat_template_args:
+        merged_kwargs.update(request_chat_template_args)
+    if request_chat_template_kwargs:
+        merged_kwargs.update(request_chat_template_kwargs)
+    if chat_template is not None:
+        merged_kwargs["chat_template"] = chat_template
+
+    for key in reserved_keys or []:
+        merged_kwargs.pop(key, None)
+
+    return merged_kwargs
 
 
 # Model configuration mapping
@@ -608,6 +631,7 @@ def apply_chat_template(
     return_messages: bool = False,
     num_images: int = 0,
     num_audios: int = 0,
+    chat_template_kwargs: Optional[Dict[str, Any]] = None,
     **kwargs,
 ) -> Union[List[Dict[str, Any]], str, Any]:
     """
@@ -621,6 +645,7 @@ def apply_chat_template(
         return_messages: Whether to return messages list instead of template
         num_images: Number of images in the input
         num_audios: Number of audio files in the input
+        chat_template_kwargs: Additional kwargs forwarded to processor.apply_chat_template
         **kwargs: Additional arguments for message formatting
 
     Returns:
@@ -707,4 +732,7 @@ def apply_chat_template(
     if model_type in ["paligemma", "molmo", "florence2"]:
         return messages[-1]
 
-    return get_chat_template(processor, messages, add_generation_prompt)
+    template_kwargs = dict(chat_template_kwargs or {})
+    return get_chat_template(
+        processor, messages, add_generation_prompt, **template_kwargs
+    )
