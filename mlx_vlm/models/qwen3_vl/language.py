@@ -169,7 +169,9 @@ class Attention(nn.Module):
         cos, sin = self.rotary_emb(values, position_ids)
 
         if mask is not None and isinstance(mask, mx.array):
-            mask = mask[..., :kv_seq_len]
+            if isinstance(kv_seq_len, mx.array):
+                kv_seq_len = kv_seq_len.max().item()
+            mask = mask[..., : int(kv_seq_len)]
 
         queries, keys = apply_multimodal_rotary_pos_emb(queries, keys, cos, sin)
 
@@ -508,9 +510,10 @@ class LanguageModel(nn.Module):
         pixel_values = kwargs.pop("pixel_values", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
-        # reset rope_deltas when processing a new image/video
+        # reset rope_deltas and position_ids when processing a new image/video
         if pixel_values is not None:
             self._rope_deltas = None
+            self._position_ids = None
 
         cache_offset = 0
         if cache and cache[0] is not None:

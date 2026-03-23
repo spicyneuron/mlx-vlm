@@ -7,6 +7,7 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
 - [Installation](#installation)
 - [Usage](#usage)
   - [Command Line Interface (CLI)](#command-line-interface-cli)
+    - [Thinking Budget](#thinking-budget)
   - [Chat UI with Gradio](#chat-ui-with-gradio)
   - [Python Script](#python-script)
 - [Activation Quantization (CUDA)](#activation-quantization-cuda)
@@ -26,6 +27,11 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | DeepSeek-OCR-2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr_2/README.md) |
 | DOTS-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/dots_ocr/README.md) |
 | GLM-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/glm_ocr/README.md) |
+| Phi-4 Reasoning Vision | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/phi4_siglip/README.md) |
+| MiniCPM-o | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minicpmo/README.md) |
+| Phi-4 Multimodal | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/phi4mm/README.md) |
+| MolmoPoint | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/molmo_point/README.md) |
+| Moondream3 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/moondream3/README.md) |
 
 ## Installation
 
@@ -34,14 +40,6 @@ The easiest way to get started is to install the `mlx-vlm` package using pip:
 ```sh
 pip install -U mlx-vlm
 ```
-
-Some models (e.g., Qwen2-VL) require additional dependencies from the `torch` extra:
-
-```sh
-pip install -U mlx-vlm[torch]
-```
-
-This installs `torch`, `torchvision`, and other dependencies needed by certain model processors.
 
 ## Usage
 
@@ -62,6 +60,28 @@ mlx_vlm.generate --model mlx-community/gemma-3n-E2B-it-4bit --max-tokens 100 --p
 # Multi-modal generation (Image + Audio)
 mlx_vlm.generate --model mlx-community/gemma-3n-E2B-it-4bit --max-tokens 100 --prompt "Describe what you see and hear" --image /path/to/image.jpg --audio /path/to/audio.wav
 ```
+
+#### Thinking Budget
+
+For thinking models (e.g., Qwen3.5), you can limit the number of tokens spent in the thinking block:
+
+```sh
+mlx_vlm.generate --model mlx-community/Qwen3.5-2B-4bit \
+  --thinking-budget 50 \
+  --thinking-start-token "<think>" \
+  --thinking-end-token "</think>" \
+  --enable-thinking \
+  --prompt "Solve 2+2"
+```
+
+| Flag | Description |
+|------|-------------|
+| `--enable-thinking` | Activate thinking mode in the chat template |
+| `--thinking-budget` | Max tokens allowed inside the thinking block |
+| `--thinking-start-token` | Token that opens a thinking block (default: `<think>`) |
+| `--thinking-end-token` | Token that closes a thinking block (default: `</think>`) |
+
+When the budget is exceeded, the model is forced to emit `\n</think>` and transition to the answer. If `--enable-thinking` is passed but the model's chat template does not support it, the budget is applied only if the model generates the start token on its own.
 
 ### Chat UI with Gradio
 
@@ -162,12 +182,20 @@ Start the server:
 ```sh
 mlx_vlm.server --port 8080
 
+# Preload a model at startup (Hugging Face repo or local path)
+mlx_vlm.server --model <hf_repo_or_local_path>
+
+# Preload a model with adapter
+mlx_vlm.server --model <hf_repo_or_local_path> --adapter-path <adapter_path>
+
 # With trust remote code enabled (required for some models)
 mlx_vlm.server --trust-remote-code
 ```
 
 #### Server Options
 
+- `--model`: Preload a model at server startup, accepts a Hugging Face repo ID or local path (optional, loads lazily on first request if omitted)
+- `--adapter-path`: Path for adapter weights to use with the preloaded model
 - `--host`: Host address (default: `0.0.0.0`)
 - `--port`: Port number (default: `8080`)
 - `--trust-remote-code`: Trust remote code when loading models from Hugging Face Hub
@@ -181,9 +209,9 @@ The server provides multiple endpoints for different use cases and supports dyna
 
 #### Available Endpoints
 
-- `/models` - List models available locally
-- `/chat/completions` - OpenAI-compatible chat-style interaction endpoint with support for images, audio, and text
-- `/responses` - OpenAI-compatible responses endpoint
+- `/models` and `/v1/models` - List models available locally
+- `/chat/completions` and `/v1/chat/completions` - OpenAI-compatible chat-style interaction endpoint with support for images, audio, and text
+- `/responses` and `/v1/responses` - OpenAI-compatible responses endpoint
 - `/health` - Check server status
 - `/unload` - Unload current model from memory
 
@@ -220,6 +248,7 @@ curl -X POST "http://localhost:8080/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "mlx-community/Qwen2.5-VL-32B-Instruct-8bit",
+    "messages":
     [
       {
         "role": "system",
@@ -230,7 +259,7 @@ curl -X POST "http://localhost:8080/chat/completions" \
         "content": [
           {
             "type": "text",
-            "text": This is today's chart for energy demand in California. Can you provide an analysis of the chart and comment on the implications for renewable energy in California?"
+            "text": "This is today's chart for energy demand in California. Can you provide an analysis of the chart and comment on the implications for renewable energy in California?"
           },
           {
             "type": "input_image",
@@ -310,6 +339,9 @@ curl -X POST "http://localhost:8080/responses" \
 - `max_tokens`: Maximum tokens to generate
 - `temperature`: Sampling temperature
 - `top_p`: Top-p sampling parameter
+- `top_k`: Top-k sampling cutoff
+- `min_p`: Min-p sampling threshold
+- `repetition_penalty`: Penalty applied to repeated tokens
 - `stream`: Enable streaming responses
 
 

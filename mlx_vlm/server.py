@@ -1,38 +1,112 @@
 import argparse
-import asyncio
 import gc
+import importlib
 import json
 import os
+import re
+import time
 import traceback
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Any, List, Literal, Optional, Tuple, Union
+from typing import Any, List, Literal, Optional, Union
 
 import mlx.core as mx
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from huggingface_hub import scan_cache_dir
-from pydantic import BaseModel, ConfigDict, Field
+from mlx_lm.tokenizer_utils import _infer_tool_parser
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing_extensions import Required, TypeAlias, TypedDict
 
 from .generate import (
+    DEFAULT_KV_GROUP_SIZE,
     DEFAULT_MAX_TOKENS,
     DEFAULT_MODEL_PATH,
+    DEFAULT_PREFILL_STEP_SIZE,
+    DEFAULT_QUANTIZED_KV_START,
     DEFAULT_SEED,
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
     generate,
+    normalize_resize_shape,
     stream_generate,
 )
 from .prompt_utils import apply_chat_template
 from .utils import load
 from .version import __version__
 
+DEFAULT_SERVER_HOST = "0.0.0.0"
+DEFAULT_SERVER_PORT = 8080
+
+
+def get_prefill_step_size():
+    return int(os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE))
+
+
+def get_quantized_kv_bits(model: str):
+    kv_bits = int(os.environ.get("KV_BITS", 0))
+    if kv_bits == 0:
+        return None
+    if "qat" in model:
+        print(
+            f"Model {model} is quantization aware, (Rotating)KVCache cache will not be quantized to {kv_bits} bits, use --max-kv-size [tokens] instead."
+        )
+        return None
+    return kv_bits
+
+
+def get_kv_group_size():
+    return int(os.environ.get("KV_GROUP_SIZE", DEFAULT_KV_GROUP_SIZE))
+
+
+def get_max_kv_size(model: str):
+    max_kv_tokens = int(os.environ.get("MAX_KV_SIZE", 0))
+    if max_kv_tokens == 0:
+        return None
+    if get_quantized_kv_bits(model) is not None:
+        print(
+            f"Model {model} uses QuantizedKVCache cache, can't set max KV size, use --kv-bits [bits] instead."
+        )
+        return None
+    return max_kv_tokens
+
+
+def get_quantized_kv_start():
+    return int(os.environ.get("QUANTIZED_KV_START", DEFAULT_QUANTIZED_KV_START))
+
+
+@asynccontextmanager
+async def lifespan(app):
+    # Startup
+    model_path = os.environ.get("PRELOAD_MODEL")
+    adapter_path = os.environ.get("PRELOAD_ADAPTER") or None
+    if model_path:
+        try:
+            print(f"Preloading model: {model_path}")
+            get_cached_model(model_path, adapter_path)
+        except Exception as e:
+            print(f"Failed to preload model: {e}")
+            print("Server will continue without a preloaded model.")
+    yield
+    unload_model_sync()
+
+
 app = FastAPI(
     title="MLX-VLM Inference API",
     description="API for using Vision Language Models (VLMs) and Omni Models (Vision, Audio and Video support) with MLX.",
     version=__version__,
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 MAX_IMAGES = 10  # Maximum number of images to process at once
@@ -46,6 +120,9 @@ class FlexibleBaseModel(BaseModel):
     """Base model that ignores/accepts any unknown OpenAI SDK fields."""
 
     model_config = ConfigDict(extra="allow")
+
+    def dump_kwargs(self, *fields: str) -> dict[str, Any]:
+        return self.model_dump(include=set(fields), exclude_none=True)
 
 
 def load_model_resources(model_path: str, adapter_path: Optional[str]):
@@ -142,7 +219,7 @@ class ResponseInputImageParam(TypedDict, total=False):
     )
     """The detail level of the image to be sent to the model.
 
-    One of `high`, `low`, or `auto`. Defaults to `auto`.
+    One of `high`, `low`, or `auto`.
     """
     type: Required[
         Literal["input_image"]
@@ -184,6 +261,8 @@ ResponseInputContentParam: TypeAlias = Union[
     ResponseInputAudioParam,
 ]
 
+ResizeShapeInput: TypeAlias = tuple[int] | tuple[int, int]
+
 ResponseInputMessageContentListParam: TypeAlias = List[ResponseInputContentParam]
 
 
@@ -198,16 +277,83 @@ ResponseOutputMessageContentList: TypeAlias = List[ResponseOutputText]
 
 
 class ChatMessage(FlexibleBaseModel):
-    role: Literal["user", "assistant", "system", "developer"] = Field(
+    role: Literal["user", "assistant", "system", "developer", "tool"] = Field(
         ...,
         description="Role of the message sender (e.g., 'system', 'user', 'assistant').",
     )
-    content: Union[
-        str, ResponseInputMessageContentListParam, ResponseOutputMessageContentList
-    ] = Field(..., description="Content of the message.")
+    content: Optional[
+        Union[
+            str,
+            ResponseInputMessageContentListParam,
+            ResponseOutputMessageContentList,
+        ]
+    ] = Field(None, description="Content of the message.")
+    tool_calls: List = []
 
 
-class OpenAIRequest(FlexibleBaseModel):
+class GenerationParams(FlexibleBaseModel):
+    temperature: float = Field(
+        DEFAULT_TEMPERATURE,
+        description="Temperature for sampling.",
+    )
+    top_p: float = Field(
+        DEFAULT_TOP_P,
+        description="Top-p sampling.",
+    )
+    top_k: Optional[int] = Field(
+        None,
+        description="Top-k sampling cutoff.",
+    )
+    min_p: Optional[float] = Field(
+        None,
+        description="Min-p sampling threshold.",
+    )
+    repetition_penalty: Optional[float] = Field(
+        None, description="Penalty applied to repeated tokens."
+    )
+    logit_bias: Optional[dict[int, float]] = Field(
+        None, description="Additive logit bias keyed by token id."
+    )
+
+    def shared_generation_kwargs(self) -> dict[str, Any]:
+        return self.dump_kwargs(
+            "temperature",
+            "top_p",
+            "top_k",
+            "min_p",
+            "repetition_penalty",
+            "logit_bias",
+        )
+
+
+class TemplateParams(FlexibleBaseModel):
+    enable_thinking: Optional[bool] = Field(
+        None,
+        description="Enable thinking mode in the chat template.",
+    )
+    thinking_budget: Optional[int] = Field(
+        None,
+        description="Maximum number of thinking tokens before forcing the end token.",
+    )
+    thinking_start_token: Optional[str] = Field(
+        None,
+        description="Token that marks the start of a thinking block.",
+    )
+    thinking_end_token: Optional[str] = Field(
+        None,
+        description="Token that marks the end of a thinking block.",
+    )
+
+    def template_kwargs(self) -> dict[str, Any]:
+        return self.dump_kwargs(
+            "enable_thinking",
+            "thinking_budget",
+            "thinking_start_token",
+            "thinking_end_token",
+        )
+
+
+class OpenAIRequest(GenerationParams, TemplateParams):
     """
     OpenAI-compatible request structure.
     Using this structure : https://github.com/openai/openai-python/blob/main/src/openai/resources/responses/responses.py
@@ -218,15 +364,17 @@ class OpenAIRequest(FlexibleBaseModel):
     )
     model: str = Field(..., description="The model to use for generation.")
     max_output_tokens: int = Field(
-        DEFAULT_MAX_TOKENS, description="Maximum number of tokens to generate."
+        DEFAULT_MAX_TOKENS,
+        description="Maximum number of tokens to generate.",
     )
-    temperature: float = Field(
-        DEFAULT_TEMPERATURE, description="Temperature for sampling."
-    )
-    top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
     stream: bool = Field(
         False, description="Whether to stream the response chunk by chunk."
     )
+
+    def generation_kwargs(self) -> dict[str, Any]:
+        kwargs = self.dump_kwargs("max_output_tokens")
+        kwargs["max_tokens"] = kwargs.pop("max_output_tokens")
+        return {**kwargs, **self.shared_generation_kwargs()}
 
 
 class OpenAIUsage(BaseModel):
@@ -386,7 +534,7 @@ StreamEvent = Union[
 # Models for /chat/completion endpoint
 
 
-class VLMRequest(FlexibleBaseModel):
+class VLMRequest(GenerationParams, TemplateParams):
     model: str = Field(
         DEFAULT_MODEL_PATH,
         description="The path to the local model directory or Hugging Face repo.",
@@ -395,17 +543,25 @@ class VLMRequest(FlexibleBaseModel):
         None, description="The path to the adapter weights."
     )
     max_tokens: int = Field(
-        DEFAULT_MAX_TOKENS, description="Maximum number of tokens to generate."
+        DEFAULT_MAX_TOKENS,
+        description="Maximum number of tokens to generate.",
     )
-    temperature: float = Field(
-        DEFAULT_TEMPERATURE, description="Temperature for sampling."
-    )
-    top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
     seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
-    resize_shape: Optional[Tuple[int, int]] = Field(
+    resize_shape: Optional[ResizeShapeInput] = Field(
         None,
-        description="Resize shape for the image (height, width). Provide two integers.",
+        description="Resize shape for the image. Provide one integer for a square resize or two integers for (height, width).",
     )
+
+    @field_validator("resize_shape", mode="before")
+    @classmethod
+    def normalize_resize_shape_field(cls, value):
+        return normalize_resize_shape(value)
+
+    def generation_kwargs(self) -> dict[str, Any]:
+        return {
+            **self.dump_kwargs("max_tokens", "resize_shape"),
+            **self.shared_generation_kwargs(),
+        }
 
 
 class GenerationRequest(VLMRequest):
@@ -448,14 +604,77 @@ class ChatResponse(BaseModel):
 
 
 class ChatStreamChoice(BaseModel):
+    index: int = 0
     finish_reason: Optional[str] = None
     delta: ChatMessage
 
 
 class ChatStreamChunk(BaseModel):
+    id: str
+    object: str = "chat.completion.chunk"
+    created: int
     model: str
     choices: List[ChatStreamChoice]
     usage: Optional[UsageStats]
+
+
+def build_generation_kwargs(
+    request: Any,
+    template_kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "prefill_step_size": get_prefill_step_size(),
+        "kv_bits": get_quantized_kv_bits(request.model),
+        "kv_group_size": get_kv_group_size(),
+        "max_kv_size": get_max_kv_size(request.model),
+        "quantized_kv_start": get_quantized_kv_start(),
+        **request.generation_kwargs(),
+        **template_kwargs,
+    }
+
+
+def process_tool_calls(model_output: str, tool_module, tools):
+    called_tools = []
+    remaining = model_output
+
+    if tool_module.tool_call_start in model_output:
+        if tool_module.tool_call_end == "":
+            pattern = re.compile(
+                f"{re.escape(tool_module.tool_call_start)}.*?(?:\n|$)", re.DOTALL
+            )
+
+        else:
+            pattern = re.compile(
+                f"{re.escape(tool_module.tool_call_start)}.*?{re.escape(tool_module.tool_call_end)}",
+                re.DOTALL,
+            )
+
+        matches = re.findall(pattern, model_output)
+        if matches:
+            remaining = re.sub(pattern, " ", model_output).strip()
+            tool_call_index = 0
+            for match in matches:
+                call = (
+                    match.strip()
+                    .removeprefix(tool_module.tool_call_start)
+                    .removesuffix(tool_module.tool_call_end)
+                )
+                try:
+                    tool_call = tool_module.parse_tool_call(call, tools)
+                    called_tool = {}
+                    called_tool["type"] = "function"
+                    called_tool["index"] = tool_call_index
+                    called_tool["id"] = str(uuid.uuid4())
+                    called_tool["function"] = {}
+                    called_tool["function"]["name"] = tool_call["name"].strip()
+                    called_tool["function"]["arguments"] = json.dumps(
+                        tool_call["arguments"], ensure_ascii=False
+                    )
+                    called_tools.append(called_tool)
+                    tool_call_index += 1
+                except Exception:
+                    print(f"Invalid tool call: {call}")
+    return dict(calls=called_tools, remaining_text=remaining)
 
 
 # Models for /models endpoint
@@ -476,7 +695,8 @@ class ModelsResponse(BaseModel):
 
 
 @app.post("/responses")
-async def responses_endpoint(request: Request):
+@app.post("/v1/responses", include_in_schema=False)
+async def responses_endpoint(openai_request: OpenAIRequest):
     """
     OpenAI-compatible endpoint for generating text based on a prompt and optional images.
 
@@ -531,14 +751,9 @@ async def responses_endpoint(request: Request):
 
     """
 
-    body = await request.json()
-    openai_request = OpenAIRequest(**body)
-
     try:
         # Get model, processor, config - loading if necessary
         model, processor, config = get_cached_model(openai_request.model)
-
-        kwargs = {}
 
         chat_messages = []
         images = []
@@ -551,7 +766,9 @@ async def responses_endpoint(request: Request):
                 # If input is a list, treat it as a series of chat messages
                 for message in openai_request.input:
                     if isinstance(message, ChatMessage):
-                        if isinstance(message.content, str):
+                        if message.content is None:
+                            chat_messages.append({"role": message.role, "content": ""})
+                        elif isinstance(message.content, str):
                             chat_messages.append(
                                 {"role": message.role, "content": message.content}
                             )
@@ -607,9 +824,15 @@ async def responses_endpoint(request: Request):
             print("no input")
             raise HTTPException(status_code=400, detail="Missing input.")
 
+        template_kwargs = openai_request.template_kwargs()
         formatted_prompt = apply_chat_template(
-            processor, config, chat_messages, num_images=len(images)
+            processor,
+            config,
+            chat_messages,
+            num_images=len(images),
+            **template_kwargs,
         )
+        generation_kwargs = build_generation_kwargs(openai_request, template_kwargs)
 
         generated_at = datetime.now().timestamp()
         response_id = f"resp_{uuid.uuid4().hex}"
@@ -668,10 +891,7 @@ async def responses_endpoint(request: Request):
                         processor=processor,
                         prompt=formatted_prompt,
                         image=images,
-                        temperature=openai_request.temperature,
-                        max_tokens=openai_request.max_output_tokens,
-                        top_p=openai_request.top_p,
-                        **kwargs,
+                        **generation_kwargs,
                     )
 
                     full_text = ""
@@ -689,7 +909,6 @@ async def responses_endpoint(request: Request):
 
                         # Send response.output_text.delta event
                         yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
-                        await asyncio.sleep(0.01)
 
                     # Send response.output_text.done event (to match the openai pipeline)
                     yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=0, content_index=0, text=full_text).model_dump_json()}\n\n"
@@ -736,7 +955,15 @@ async def responses_endpoint(request: Request):
                     gc.collect()
                     print("Stream finished, cleared cache.")
 
-            return StreamingResponse(stream_generator(), media_type="text/event-stream")
+            return StreamingResponse(
+                stream_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
 
         else:
             # Non-streaming response
@@ -747,11 +974,8 @@ async def responses_endpoint(request: Request):
                     processor=processor,
                     prompt=formatted_prompt,
                     image=images,
-                    temperature=openai_request.temperature,
-                    max_tokens=openai_request.max_output_tokens,
-                    top_p=openai_request.top_p,
                     verbose=False,  # stats are passed in the response
-                    **kwargs,
+                    **generation_kwargs,
                 )
                 # Clean up resources
                 mx.clear_cache()
@@ -812,6 +1036,7 @@ async def responses_endpoint(request: Request):
 @app.post(
     "/chat/completions", response_model=None
 )  # Response model handled dynamically based on stream flag
+@app.post("/v1/chat/completions", response_model=None, include_in_schema=False)
 async def chat_completions_endpoint(request: ChatRequest):
     """
     Generate text based on a prompt and optional images.
@@ -824,27 +1049,13 @@ async def chat_completions_endpoint(request: ChatRequest):
         # Get model, processor, config - loading if necessary
         model, processor, config = get_cached_model(request.model, request.adapter_path)
 
-        kwargs = {}
-
-        if request.resize_shape is not None:
-            if len(request.resize_shape) not in [1, 2]:
-                raise HTTPException(
-                    status_code=400,
-                    detail="resize_shape must contain exactly two integers (height, width)",
-                )
-            kwargs["resize_shape"] = (
-                (request.resize_shape[0],) * 2
-                if len(request.resize_shape) == 1
-                else tuple(request.resize_shape)
-            )
-
-        chat_messages = request.messages
-
         images = []
         audio = []
         processed_messages = []
         for message in request.messages:
-            if isinstance(message.content, str):
+            if message.content is None:
+                processed_messages.append({"role": message.role, "content": ""})
+            elif isinstance(message.content, str):
                 processed_messages.append(
                     {"role": message.role, "content": message.content}
                 )
@@ -866,13 +1077,31 @@ async def chat_completions_endpoint(request: ChatRequest):
                     {"role": message.role, "content": text_content}
                 )
 
+        tools = None
+        if hasattr(request, "tools"):
+            tools = request.tools
+
+        tool_parser_type = None
+        tokenizer = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
+        if hasattr(tokenizer, "chat_template"):
+            tool_parser_type = _infer_tool_parser(tokenizer.chat_template)
+            if tool_parser_type is not None:
+                tool_module = importlib.import_module(
+                    f"mlx_lm.tool_parsers.{tool_parser_type}"
+                )
+        template_kwargs = request.template_kwargs()
         formatted_prompt = apply_chat_template(
             processor,
             config,
             processed_messages,
             num_images=len(images),
             num_audios=len(audio),
+            tools=tools,
+            **template_kwargs,
         )
+        generation_kwargs = build_generation_kwargs(request, template_kwargs)
 
         if request.stream:
             # Streaming response
@@ -886,16 +1115,17 @@ async def chat_completions_endpoint(request: ChatRequest):
                         prompt=formatted_prompt,
                         image=images,
                         audio=audio,
-                        temperature=request.temperature,
-                        max_tokens=request.max_tokens,
-                        top_p=request.top_p,
-                        **kwargs,
+                        **generation_kwargs,
                     )
 
+                    output_text = ""
+                    request_id = f"chatcmpl-{uuid.uuid4()}"
                     for chunk in token_iterator:
                         if chunk is None or not hasattr(chunk, "text"):
                             print("Warning: Received unexpected chunk format:", chunk)
                             continue
+
+                        output_text += chunk.text
 
                         # Yield chunks in Server-Sent Events (SSE) format
                         usage_stats = {
@@ -914,25 +1144,47 @@ async def chat_completions_endpoint(request: ChatRequest):
                             )
                         ]
                         chunk_data = ChatStreamChunk(
-                            model=request.model, usage=usage_stats, choices=choices
+                            id=request_id,
+                            created=int(time.time()),
+                            model=request.model,
+                            usage=usage_stats,
+                            choices=choices,
                         )
 
                         yield f"data: {chunk_data.model_dump_json()}\n\n"
-                        await asyncio.sleep(
-                            0.01
-                        )  # Small sleep to prevent blocking event loop entirely
+
+                    if tool_parser_type is not None:
+                        tool_calls = process_tool_calls(
+                            model_output=output_text,
+                            tool_module=tool_module,
+                            tools=tools,
+                        )
+                    else:
+                        tool_calls = {}
+                        tool_calls["calls"] = []
 
                     # Signal stream end
                     choices = [
                         ChatStreamChoice(
                             finish_reason="stop",
-                            delta=ChatMessage(role="assistant", content=""),
+                            delta=ChatMessage(
+                                role="assistant",
+                                content="",
+                                tool_calls=tool_calls["calls"],
+                            ),
                         )
                     ]
+
                     chunk_data = ChatStreamChunk(
-                        model=request.model, usage=usage_stats, choices=choices
+                        id=request_id,
+                        created=int(time.time()),
+                        model=request.model,
+                        usage=usage_stats,
+                        choices=choices,
                     )
                     yield f"data: {chunk_data.model_dump_json()}\n\n"
+
+                    yield "data: [DONE]\n\n"
 
                 except Exception as e:
                     print(f"Error during stream generation: {e}")
@@ -945,7 +1197,15 @@ async def chat_completions_endpoint(request: ChatRequest):
                     gc.collect()
                     print("Stream finished, cleared cache.")
 
-            return StreamingResponse(stream_generator(), media_type="text/event-stream")
+            return StreamingResponse(
+                stream_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
 
         else:
             # Non-streaming response
@@ -957,11 +1217,8 @@ async def chat_completions_endpoint(request: ChatRequest):
                     prompt=formatted_prompt,
                     image=images,
                     audio=audio,
-                    temperature=request.temperature,
-                    max_tokens=request.max_tokens,
-                    top_p=request.top_p,
                     verbose=False,  # Keep API output clean
-                    **kwargs,
+                    **generation_kwargs,
                 )
                 # Clean up resources
                 mx.clear_cache()
@@ -977,12 +1234,28 @@ async def chat_completions_endpoint(request: ChatRequest):
                     peak_memory=gen_result.peak_memory,
                 )
 
+                if tool_parser_type is not None:
+                    tool_calls = process_tool_calls(
+                        model_output=gen_result.text,
+                        tool_module=tool_module,
+                        tools=tools,
+                    )
+                else:
+                    tool_calls = {}
+                    tool_calls["calls"] = []
+                    tool_calls["remaining_text"] = gen_result.text
+
                 choices = [
                     ChatChoice(
                         finish_reason="stop",
-                        message=ChatMessage(role="assistant", content=gen_result.text),
+                        message=ChatMessage(
+                            role="assistant",
+                            content=tool_calls["remaining_text"],
+                            tool_calls=tool_calls["calls"],
+                        ),
                     )
                 ]
+
                 result = ChatResponse(
                     model=request.model, usage=usage_stats, choices=choices
                 )
@@ -1011,6 +1284,7 @@ async def chat_completions_endpoint(request: ChatRequest):
 
 
 @app.get("/models", response_model=ModelsResponse)
+@app.get("/v1/models", response_model=ModelsResponse, include_in_schema=False)
 def models_endpoint():
     """
     Return list of locally downloaded MLX models.
@@ -1071,7 +1345,7 @@ async def unload_model_endpoint():
 
     return {
         "status": "success",
-        "message": f"Model unloaded successfully",
+        "message": "Model unloaded successfully",
         "unloaded": unloaded_info,
     }
 
@@ -1079,25 +1353,77 @@ async def unload_model_endpoint():
 def main():
     parser = argparse.ArgumentParser(description="MLX VLM Http Server.")
     parser.add_argument(
+        "--model",
+        type=str,
+        help="Optional path to the MLX model weights, tokenizer, and config",
+    )
+    parser.add_argument(
+        "--adapter-path",
+        type=str,
+        help="Optional path for the trained adapter weights and config.",
+    )
+    parser.add_argument(
         "--host",
         type=str,
-        default="0.0.0.0",
-        help="Host for the HTTP server (default:0.0.0.0)",
+        default=DEFAULT_SERVER_HOST,
+        help="Host for the HTTP server (default: %(default)s)",
     )
     parser.add_argument(
         "--port",
         type=int,
-        default=8080,
-        help="Port for the HTTP server (default: 8080)",
+        default=DEFAULT_SERVER_PORT,
+        help="Port for the HTTP server (default: %(default)s)",
     )
     parser.add_argument(
         "--trust-remote-code",
         action="store_true",
         help="Trust remote code when loading models from Hugging Face Hub.",
     )
+    parser.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=DEFAULT_PREFILL_STEP_SIZE,
+        help="Number of tokens to process per prefill step. "
+        "Lower values reduce peak memory usage but may be slower. "
+        "Try 512 or 256 if you hit GPU memory errors during prefill.",
+    )
+    parser.add_argument(
+        "--kv-bits",
+        type=int,
+        default=0,
+        help="Number of bits for KV cache quantization.",
+    )
+    parser.add_argument(
+        "--kv-group-size",
+        type=int,
+        default=DEFAULT_KV_GROUP_SIZE,
+        help="Group size for KV cache quantization.",
+    )
+    parser.add_argument(
+        "--max-kv-size",
+        type=int,
+        default=0,
+        help="Maximum KV size for the prompt cache (tokens).",
+    )
+    parser.add_argument(
+        "--quantized-kv-start",
+        type=int,
+        default=DEFAULT_QUANTIZED_KV_START,
+        help="Start index (of token) for the quantized KV cache.",
+    )
     args = parser.parse_args()
     if args.trust_remote_code:
         os.environ["MLX_TRUST_REMOTE_CODE"] = "true"
+    if args.model:
+        os.environ["PRELOAD_MODEL"] = args.model
+    if args.adapter_path:
+        os.environ["PRELOAD_ADAPTER"] = args.adapter_path
+    os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
+    os.environ["KV_BITS"] = str(args.kv_bits)
+    os.environ["KV_GROUP_SIZE"] = str(args.kv_group_size)
+    os.environ["MAX_KV_SIZE"] = str(args.max_kv_size)
+    os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
+
     uvicorn.run(
         "mlx_vlm.server:app", host=args.host, port=args.port, workers=1, reload=True
     )  # reload=True for development to automatically restart on code changes.

@@ -4,6 +4,7 @@ import contextlib
 import functools
 import json
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
 
@@ -17,17 +18,31 @@ from transformers import PreTrainedTokenizer
 
 from .models import cache
 from .prompt_utils import apply_chat_template
-from .utils import StoppingCriteria, group_images_by_shape, load, prepare_inputs
+from .utils import (
+    StoppingCriteria,
+    ThinkingBudgetCriteria,
+    group_images_by_shape,
+    load,
+    prepare_inputs,
+)
 
 DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
 DEFAULT_IMAGE = None
 DEFAULT_AUDIO = None
 DEFAULT_PROMPT = "What are these?"
 DEFAULT_MAX_TOKENS = 256
-DEFAULT_TEMPERATURE = 0.5
+DEFAULT_TEMPERATURE = 0.0
 DEFAULT_TOP_P = 1.0
 DEFAULT_SEED = 0
+DEFAULT_TOP_K = 0
+DEFAULT_MIN_P = 0.0
+DEFAULT_REPETITION_CONTEXT_SIZE = 20
+DEFAULT_KV_GROUP_SIZE = 64
+DEFAULT_COMPLETION_BATCH_SIZE = 32
+DEFAULT_PREFILL_BATCH_SIZE = 8
+DEFAULT_THINKING_END_TOKEN = "</think>"
 DEFAULT_QUANTIZED_KV_START = 5000
+DEFAULT_PREFILL_STEP_SIZE = 2048
 
 
 def parse_arguments():
@@ -116,7 +131,7 @@ def parse_arguments():
     parser.add_argument(
         "--kv-group-size",
         type=int,
-        default=64,
+        default=DEFAULT_KV_GROUP_SIZE,
         help="Group size for the KV cache.",
     )
     parser.add_argument(
@@ -163,13 +178,52 @@ def parse_arguments():
     parser.add_argument(
         "--prefill-step-size",
         type=int,
-        default=None,
+        default=DEFAULT_PREFILL_STEP_SIZE,
         help="Number of tokens to process per prefill step. "
         "Lower values reduce peak memory usage but may be slower. "
         "Try 512 or 256 if you hit GPU memory errors during prefill.",
     )
+    parser.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        help="Enable thinking mode in the chat template (e.g. for Qwen3.5).",
+    )
+    parser.add_argument(
+        "--thinking-budget",
+        type=int,
+        default=None,
+        help="Maximum number of thinking tokens before forcing the end-of-thinking token.",
+    )
+    parser.add_argument(
+        "--thinking-start-token",
+        type=str,
+        default=None,
+        help="Token that marks the start of a thinking block (e.g. '<think>'). "
+        "If not set, thinking is assumed to start immediately.",
+    )
+    parser.add_argument(
+        "--thinking-end-token",
+        type=str,
+        default=DEFAULT_THINKING_END_TOKEN,
+        help="Token that marks the end of a thinking block (default: %(default)s).",
+    )
 
     return parser.parse_args()
+
+
+def normalize_resize_shape(
+    values: Optional[Sequence[int]],
+) -> Optional[Tuple[int, int]]:
+    if values is None:
+        return None
+    if not (
+        isinstance(values, Sequence)
+        and not isinstance(values, (str, bytes))
+        and len(values) in (1, 2)
+        and all(type(value) is int for value in values)
+    ):
+        raise ValueError("resize_shape must contain 1 or 2 integers")
+    return (values[0], values[0]) if len(values) == 1 else tuple(values)
 
 
 # A stream on the default device just for generation
@@ -233,20 +287,22 @@ def generate_step(
     pixel_values,
     mask,
     *,
-    max_tokens: int = 256,
-    temperature: float = 0.0,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    temperature: float = DEFAULT_TEMPERATURE,
     repetition_penalty: Optional[float] = None,
-    repetition_context_size: Optional[int] = 20,
-    top_p: float = 1.0,
+    repetition_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE,
+    top_p: float = DEFAULT_TOP_P,
+    min_p: float = DEFAULT_MIN_P,
+    top_k: int = DEFAULT_TOP_K,
     logit_bias: Optional[Dict[int, float]] = None,
     prompt_cache: Optional[List[Any]] = None,
     max_kv_size: Optional[int] = None,
     kv_bits: Optional[int] = None,
-    kv_group_size: int = 64,
-    quantized_kv_start: int = 0,
+    kv_group_size: int = DEFAULT_KV_GROUP_SIZE,
+    quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
     sampler: Optional[Callable[[mx.array], mx.array]] = None,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
-    prefill_step_size: Optional[int] = 2048,
+    prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
     **kwargs,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
@@ -257,29 +313,31 @@ def generate_step(
         model (nn.Module): The model to use for generation.
         pixel_values: The pixel values for vision models (optional).
         mask: The attention mask (optional).
-        max_tokens (int): Maximum number of tokens to generate. Default: ``256``.
+        max_tokens (int): Maximum number of tokens to generate.
         temperature (float): The temperature for sampling, if 0 the argmax is used.
-          Default: ``0``.
         repetition_penalty (float, optional): The penalty factor for repeating
           tokens.
         repetition_context_size (int, optional): The number of tokens to
-          consider for repetition penalty. Default: ``20``.
+          consider for repetition penalty.
         top_p (float, optional): Nucleus sampling, higher means model considers
           more less likely words.
+        min_p (float, optional): Minimum probability threshold relative to the
+          highest-probability token.
+        top_k (int, optional): Restrict sampling to the top-k tokens.
         logit_bias (dictionary, optional): Additive logit bias.
         prompt_cache (list, optional): Pre-existing KV cache for the prompt.
         max_kv_size (int, optional): Maximum KV cache size.
         kv_bits (int, optional): Number of bits for KV cache quantization.
-        kv_group_size (int): Group size for KV cache quantization. Default: ``64``.
-        quantized_kv_start (int): Start index for quantized KV cache. Default: ``0``.
+        kv_group_size (int): Group size for KV cache quantization.
+        quantized_kv_start (int): Start index for quantized KV cache.
         sampler (Callable[mx.array, mx.array], optional): A sampler for sampling a
-          token from a vector of log probabilities. Default: ``None``.
+          token from a vector of log probabilities.
         logits_processors (List[Callable[[mx.array, mx.array], mx.array]], optional):
           A list of functions that take tokens and logits and return the processed
-          logits. Default: ``None``.
+          logits.
         prefill_step_size (int): Number of tokens to process per prefill step.
           Chunked prefill processes prompts in smaller chunks to reduce peak
-          memory usage. Default: ``2048``.
+          memory usage.
 
     Yields:
         Generator[Tuple[mx.array, mx.array], None, None]: A generator producing
@@ -294,7 +352,12 @@ def generate_step(
     )
 
     if sampler is None:
-        sampler = make_sampler(temperature, top_p)
+        sampler = make_sampler(
+            temp=temperature,
+            top_p=top_p,
+            min_p=min_p,
+            top_k=top_k,
+        )
 
     processors = make_logits_processors(
         logit_bias, repetition_penalty, repetition_context_size
@@ -304,6 +367,8 @@ def generate_step(
 
     y = input_ids
     tokens = mx.array([], dtype=input_ids.dtype)
+
+    thinking_budget_criteria = kwargs.pop("thinking_budget_criteria", None)
 
     # Create the KV cache for generation
     if prompt_cache is None:
@@ -352,7 +417,6 @@ def generate_step(
             return y, logprobs.squeeze(0)
 
     with mx.stream(generation_stream):
-
         # Get input embeddings (handles both multimodal and text-only)
         embedding_output = model.get_input_embeddings(
             input_ids, pixel_values, mask=mask, **kwargs
@@ -406,6 +470,9 @@ def generate_step(
         yield y.item(), logprobs
         if n % 256 == 0:
             mx.clear_cache()
+
+        if thinking_budget_criteria is not None:
+            next_y = thinking_budget_criteria.apply_forced_token(next_y)
         y, logprobs = next_y, next_logprobs
         n += 1
 
@@ -439,6 +506,12 @@ def stream_generate(
     """
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
 
+    # Set up thinking budget criteria if requested
+    thinking_budget = kwargs.pop("thinking_budget", None)
+    thinking_end_token = kwargs.pop("thinking_end_token", DEFAULT_THINKING_END_TOKEN)
+    thinking_start_token = kwargs.pop("thinking_start_token", None)
+    enable_thinking = kwargs.pop("enable_thinking", False)
+
     # Skip special tokens
     skip_special_tokens = kwargs.pop("skip_special_tokens", False)
     skip_special_token_ids = (
@@ -453,7 +526,7 @@ def stream_generate(
         else True
     )
 
-    resize_shape = kwargs.pop("resize_shape", None)
+    resize_shape = normalize_resize_shape(kwargs.pop("resize_shape", None))
     image_token_index = getattr(model.config, "image_token_index", None)
 
     if kwargs.get("input_ids", None) is not None:
@@ -481,17 +554,40 @@ def stream_generate(
         }
         kwargs.update(data_kwargs)
 
+    if thinking_budget is not None:
+        thinking_start_token_id = tokenizer.encode(
+            thinking_start_token, add_special_tokens=False
+        )[-1]
+        enable_thinking = enable_thinking and (
+            thinking_start_token_id in input_ids.flatten().tolist()
+        )
+        tokenizer.thinking_budget_criteria = ThinkingBudgetCriteria(
+            tokenizer=tokenizer,
+            thinking_budget=thinking_budget,
+            thinking_end_token=thinking_end_token,
+            thinking_start_token=thinking_start_token,
+            enable_thinking=enable_thinking,
+        )
+        kwargs["thinking_budget_criteria"] = tokenizer.thinking_budget_criteria
+    else:
+        tokenizer.thinking_budget_criteria = None
+
     with wired_limit(model, [generation_stream]):
         detokenizer = processor.detokenizer
         detokenizer.reset()
+        thinking_criteria = getattr(tokenizer, "thinking_budget_criteria", None)
+        gen = generate_step(input_ids, model, pixel_values, mask, **kwargs)
         tic = time.perf_counter()
-        for n, (token, logprobs) in enumerate(
-            generate_step(input_ids, model, pixel_values, mask, **kwargs)
-        ):
+
+        for n, (token, logprobs) in enumerate(gen):
             if n == 0:
                 prompt_time = time.perf_counter() - tic
                 prompt_tps = input_ids.size / prompt_time
                 tic = time.perf_counter()
+
+            # Check thinking budget and force token if needed
+            if thinking_criteria is not None:
+                thinking_criteria(token)
 
             # Stop generation if the token is in the eos_token_ids
             if tokenizer.stopping_criteria(token):
@@ -685,6 +781,10 @@ def _make_cache(model, left_padding):
     def to_batch_cache(c):
         if isinstance(c, cache.KVCache):
             return cache.BatchKVCache(left_padding)
+        elif isinstance(c, cache.ChunkedKVCache):
+            return cache.BatchKVCache(left_padding)
+        elif isinstance(c, cache.SimpleKVCache):
+            return cache.BatchKVCache(left_padding)
         elif isinstance(c, cache.ArraysCache):
             c.left_padding = mx.array(left_padding)
             return c
@@ -693,7 +793,9 @@ def _make_cache(model, left_padding):
                 raise ValueError("RotatingKVCache with keep tokens is not supported.")
             return cache.BatchRotatingKVCache(c.max_size, left_padding)
         elif isinstance(c, cache.CacheList):
-            return cache.BatchCacheList(*(to_batch_cache(sub_c) for sub_c in c.caches))
+            return cache.CacheList(*(to_batch_cache(sub_c) for sub_c in c.caches))
+        elif isinstance(c, tuple):
+            return cache.CacheList(*(to_batch_cache(sub_c) for sub_c in c))
         else:
             raise ValueError(f"{type(c)} does not yet support batching")
 
@@ -779,7 +881,6 @@ class Batch:
 
 
 class BatchGenerator:
-
     @dataclass
     class Response:
         uid: int
@@ -791,12 +892,12 @@ class BatchGenerator:
         self,
         model,
         processor,
-        max_tokens: int = 128,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
         stop_tokens: Optional[set] = None,
         sampler: Optional[Callable[[mx.array], mx.array]] = None,
-        completion_batch_size: int = 32,
-        prefill_batch_size: int = 8,
-        prefill_step_size: int = 2048,
+        completion_batch_size: int = DEFAULT_COMPLETION_BATCH_SIZE,
+        prefill_batch_size: int = DEFAULT_PREFILL_BATCH_SIZE,
+        prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
         prompt_cache=None,
     ):
         self.model = model
@@ -843,11 +944,14 @@ class BatchGenerator:
         left_padding = [max_length - l for l in lengths]
         inputs = _left_pad_prompts(inputs, max_length=max_length)
 
-        prompt_cache = (
-            _make_cache(self.model, left_padding)
-            if self.prompt_cache is None
-            else self.prompt_cache
-        )
+        if self.prompt_cache is not None:
+            prompt_cache = self.prompt_cache
+        elif len(uids) == 1 and max(left_padding) == 0:
+            # Single prompt with no padding: use standard caches to avoid
+            # numerical divergence from batch cache wrappers.
+            prompt_cache = cache.make_prompt_cache(self.model)
+        else:
+            prompt_cache = _make_cache(self.model, left_padding)
 
         # Slice batch data in kwargs to match current batch size
         batch_size = len(uids)
@@ -856,9 +960,14 @@ class BatchGenerator:
                 kwargs[key] = value[:batch_size]
 
         inputs_embeds = kwargs.pop("inputs_embeds", None)
+        if inputs_embeds is None:
+            raise ValueError("inputs_embeds is required")
 
-        if inputs_embeds is not None:
-            # Multimodal prefill
+        if (
+            self.prefill_step_size is not None
+            and inputs_embeds.shape[1] > self.prefill_step_size
+        ):
+            # Chunked prefill with embeddings
             while inputs_embeds.shape[1] > 1:
                 n_to_process = min(self.prefill_step_size, inputs_embeds.shape[1] - 1)
                 self.model(
@@ -873,18 +982,10 @@ class BatchGenerator:
                 inputs = inputs[:, n_to_process:]
                 mx.clear_cache()
 
-            kwargs = {"inputs_embeds": inputs_embeds}
+        y, logprobs = self._step(
+            inputs, prompt_cache, inputs_embeds=inputs_embeds, **kwargs
+        )
 
-        else:
-            # Text-only prefill
-            while inputs.shape[1] > 1 and inputs_embeds is None:
-                n_to_process = min(self.prefill_step_size, inputs.shape[1] - 1)
-                self.model(inputs[:, :n_to_process], cache=prompt_cache)
-                mx.eval([c.state for c in prompt_cache])
-                inputs = inputs[:, n_to_process:]
-                mx.clear_cache()
-
-        y, logprobs = self._step(inputs, prompt_cache, **kwargs)
         mx.async_eval(y, logprobs)
         mx.clear_cache()
         return Batch(
@@ -991,8 +1092,7 @@ class BatchGenerator:
         return responses
 
     def next(self, **kwargs):
-        with mx.stream(generation_stream):
-            return self._next(**kwargs)
+        return self._next(**kwargs)
 
 
 def batch_generate(
@@ -1029,11 +1129,9 @@ def batch_generate(
        max_tokens (Union[int, List[int]]): Maximum number of output tokens. This
           can be per prompt if a list is provided.
        verbose (bool): If ``True``, print tokens and timing information.
-          Default: ``False``.
        group_by_shape (bool): If ``True``, group same-shaped images for efficient
-          batch processing. Default: ``True``.
+          batch processing.
        track_image_sizes (bool): If ``True``, track and return original image sizes.
-          Default: ``True``.
        kwargs: The remaining options get passed to :obj:`BatchGenerator`.
           See :obj:`BatchGenerator` for more details.
 
@@ -1194,7 +1292,7 @@ def _generate_batch(
         else True
     )
 
-    resize_shape = kwargs.pop("resize_shape", None)
+    resize_shape = normalize_resize_shape(kwargs.pop("resize_shape", None))
     image_token_index = getattr(model.config, "image_token_index", None)
 
     inputs = prepare_inputs(
@@ -1209,6 +1307,7 @@ def _generate_batch(
     )
     input_ids = inputs.get("input_ids", None)
     pixel_values = inputs.get("pixel_values", None)
+    mask = inputs.get("attention_mask", None)
 
     data_kwargs = {
         k: v
@@ -1226,31 +1325,11 @@ def _generate_batch(
     )
 
     with wired_limit(model, [generation_stream]):
-        if pixel_values is not None:
-            embedding_output = model.get_input_embeddings(
-                input_ids, pixel_values, **data_kwargs
-            )
+        embedding_output = model.get_input_embeddings(
+            input_ids, pixel_values, mask=mask, **data_kwargs
+        )
 
-            # Normalize embedding output to a kwargs dict expected by BatchGenerator
-            if isinstance(embedding_output, dict):
-                embed_kwargs = embedding_output
-            elif hasattr(embedding_output, "to_dict"):
-                # Convert to dict and keep non-None fields
-                embed_kwargs = {
-                    k: v for k, v in embedding_output.to_dict().items() if v is not None
-                }
-            else:
-                # Assume it's directly an inputs_embeds array
-                embed_kwargs = {"inputs_embeds": embedding_output}
-
-            gen_kwargs = {
-                "pixel_values": pixel_values,
-                **data_kwargs,
-                **embed_kwargs,
-            }
-        else:
-            input_ids = mx.squeeze(input_ids, axis=0)
-            gen_kwargs = {}
+        gen_kwargs = {**data_kwargs, **embedding_output.to_dict()}
 
         uids = gen.insert(input_ids.tolist(), max_tokens)
         results = {uid: [] for uid in uids}
@@ -1259,7 +1338,14 @@ def _generate_batch(
                 if r.finish_reason != "stop":
                     results[r.uid].append(r.token)
 
-    texts = [tokenizer.decode(results[uid]) for uid in uids]
+    detokenizer = processor.detokenizer
+    texts = []
+    for uid in uids:
+        detokenizer.reset()
+        for t in results[uid]:
+            detokenizer.add_token(t)
+        detokenizer.finalize()
+        texts.append(detokenizer.text)
     return texts, gen.stats()
 
 
@@ -1283,20 +1369,20 @@ def main():
     num_audios = (
         1 if args.audio is not None else 0
     )  # TODO: Support multiple audio files
+    chat_template_kwargs = {}
+    if args.enable_thinking:
+        chat_template_kwargs["enable_thinking"] = True
+
     prompt = apply_chat_template(
-        processor, config, prompt, num_images=num_images, num_audios=num_audios
+        processor,
+        config,
+        prompt,
+        num_images=num_images,
+        num_audios=num_audios,
+        **chat_template_kwargs,
     )
 
     kwargs = {}
-
-    if args.resize_shape is not None:
-        if len(args.resize_shape) not in [1, 2]:
-            raise ValueError("Resize shape must be 1 or 2 integers")
-        kwargs["resize_shape"] = (
-            (args.resize_shape[0],) * 2
-            if len(args.resize_shape) == 1
-            else tuple(args.resize_shape)
-        )
 
     if args.eos_tokens is not None:
         eos_tokens = []
@@ -1315,13 +1401,24 @@ def main():
     if args.processor_kwargs:
         kwargs.update(args.processor_kwargs)
 
+    # Add thinking kwargs
+    if args.enable_thinking:
+        kwargs["enable_thinking"] = True
+    if args.thinking_budget is not None:
+        kwargs["thinking_budget"] = args.thinking_budget
+        kwargs["thinking_end_token"] = args.thinking_end_token
+        if args.thinking_start_token is not None:
+            kwargs["thinking_start_token"] = args.thinking_start_token
+
     if args.chat:
         chat = []
         if args.system:
             chat.append({"role": "system", "content": args.system})
         while user := input("User:"):
             chat.append({"role": "user", "content": user})
-            prompt = apply_chat_template(processor, config, chat, num_images=num_images)
+            prompt = apply_chat_template(
+                processor, config, chat, num_images=num_images, **chat_template_kwargs
+            )
             response = ""
             print("Assistant:", end="")
             stream_kwargs = {
@@ -1329,6 +1426,8 @@ def main():
                 "temperature": args.temperature,
                 **kwargs,
             }
+            if args.resize_shape is not None:
+                stream_kwargs["resize_shape"] = args.resize_shape
             if args.prefill_step_size is not None:
                 stream_kwargs["prefill_step_size"] = args.prefill_step_size
 
@@ -1359,6 +1458,8 @@ def main():
             "quantized_kv_start": args.quantized_kv_start,
             **kwargs,
         }
+        if args.resize_shape is not None:
+            gen_kwargs["resize_shape"] = args.resize_shape
         if args.prefill_step_size is not None:
             gen_kwargs["prefill_step_size"] = args.prefill_step_size
 
