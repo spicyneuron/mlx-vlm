@@ -15,6 +15,7 @@ from mlx_vlm.generate import (
     BatchResponse,
     BatchStats,
     GenerationResult,
+    resolve_generation_config,
     _left_pad_prompts,
     normalize_resize_shape,
 )
@@ -1042,6 +1043,27 @@ def test_normalize_resize_shape_accepts_two_values():
 def test_normalize_resize_shape_rejects_invalid_values(value):
     with pytest.raises(ValueError, match="resize_shape must contain 1 or 2 integers"):
         normalize_resize_shape(value)
+
+
+def test_resolve_generation_config_drops_kv_bits_for_qat_model():
+    normalized = resolve_generation_config(
+        {"kv_bits": 4, "max_kv_size": 1024},
+        model_name="demo-qat-model",
+    )
+
+    assert "kv_bits" not in normalized
+    assert normalized["max_kv_size"] == 1024
+
+
+def test_resolve_generation_config_drops_max_kv_size_for_quantized_cache():
+    normalized = resolve_generation_config(
+        {"kv_bits": 4, "max_kv_size": 1024, "kv_group_size": 64},
+        model_name="demo-model",
+    )
+
+    assert normalized["kv_bits"] == 4
+    assert normalized["kv_group_size"] == 64
+    assert "max_kv_size" not in normalized
 
 
 def test_generate_cli_smoke(capsys):

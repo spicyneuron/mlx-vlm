@@ -43,6 +43,57 @@ DEFAULT_PREFILL_BATCH_SIZE = 8
 DEFAULT_THINKING_END_TOKEN = "</think>"
 DEFAULT_QUANTIZED_KV_START = 5000
 DEFAULT_PREFILL_STEP_SIZE = 2048
+GENERATION_KWARG_KEYS = frozenset(
+    {
+        "max_tokens",
+        "temperature",
+        "top_p",
+        "top_k",
+        "min_p",
+        "repetition_penalty",
+        "logit_bias",
+        "resize_shape",
+        "prefill_step_size",
+        "kv_bits",
+        "kv_group_size",
+        "max_kv_size",
+        "quantized_kv_start",
+        "enable_thinking",
+        "thinking_budget",
+        "thinking_start_token",
+        "thinking_end_token",
+        "skip_special_tokens",
+    }
+)
+
+
+def filter_generation_config(values: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        key: value
+        for key, value in values.items()
+        if key in GENERATION_KWARG_KEYS and value is not None
+    }
+
+
+def resolve_generation_config(generation: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = {
+        "max_tokens": DEFAULT_MAX_TOKENS,
+        "temperature": DEFAULT_TEMPERATURE,
+        "top_p": DEFAULT_TOP_P,
+        "top_k": DEFAULT_TOP_K,
+        "min_p": DEFAULT_MIN_P,
+        "prefill_step_size": DEFAULT_PREFILL_STEP_SIZE,
+        "kv_group_size": DEFAULT_KV_GROUP_SIZE,
+        "quantized_kv_start": DEFAULT_QUANTIZED_KV_START,
+        **filter_generation_config(generation),
+    }
+    if "resize_shape" in normalized:
+        normalized["resize_shape"] = normalize_resize_shape(normalized["resize_shape"])
+    kv_bits = normalized.get("kv_bits")
+    if normalized.get("max_kv_size") is not None and kv_bits is not None:
+        print("QuantizedKVCache is active; max_kv_size is ignored. Use --kv-bits instead.")
+        normalized.pop("max_kv_size", None)
+    return normalized
 
 
 def parse_arguments():
@@ -1410,6 +1461,12 @@ def main():
         if args.thinking_start_token is not None:
             kwargs["thinking_start_token"] = args.thinking_start_token
 
+    generation_kwargs = resolve_generation_config({**vars(args), **kwargs})
+    if "qat" in args.model and "kv_bits" in generation_kwargs:
+        print(f"Model {args.model} is QAT; kv_bits ignored. Use --max-kv-size instead.")
+        generation_kwargs.pop("kv_bits")
+        generation_kwargs.pop("max_kv_size", None)
+
     if args.chat:
         chat = []
         if args.system:
@@ -1421,23 +1478,13 @@ def main():
             )
             response = ""
             print("Assistant:", end="")
-            stream_kwargs = {
-                "max_tokens": args.max_tokens,
-                "temperature": args.temperature,
-                **kwargs,
-            }
-            if args.resize_shape is not None:
-                stream_kwargs["resize_shape"] = args.resize_shape
-            if args.prefill_step_size is not None:
-                stream_kwargs["prefill_step_size"] = args.prefill_step_size
-
             for chunk in stream_generate(
                 model,
                 processor,
                 prompt,
                 args.image,
                 args.audio,
-                **stream_kwargs,
+                **generation_kwargs,
             ):
                 response += chunk.text
                 print(chunk.text, end="")
@@ -1446,28 +1493,14 @@ def main():
             print()
 
     else:
-        gen_kwargs = {
-            "image": args.image,
-            "audio": args.audio,
-            "temperature": args.temperature,
-            "max_tokens": args.max_tokens,
-            "verbose": args.verbose,
-            "max_kv_size": args.max_kv_size,
-            "kv_bits": args.kv_bits,
-            "kv_group_size": args.kv_group_size,
-            "quantized_kv_start": args.quantized_kv_start,
-            **kwargs,
-        }
-        if args.resize_shape is not None:
-            gen_kwargs["resize_shape"] = args.resize_shape
-        if args.prefill_step_size is not None:
-            gen_kwargs["prefill_step_size"] = args.prefill_step_size
-
         result = generate(
             model,
             processor,
             prompt,
-            **gen_kwargs,
+            image=args.image,
+            audio=args.audio,
+            verbose=args.verbose,
+            **generation_kwargs,
         )
         if not args.verbose:
             print(result.text)

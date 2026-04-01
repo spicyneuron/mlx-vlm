@@ -89,6 +89,24 @@ SINGLE_IMAGE_ONLY_MODELS = {
     "multi_modality",
     "mllama",
 }
+CHAT_TEMPLATE_KWARG_KEYS = frozenset(
+    {
+        "enable_thinking",
+        "thinking_budget",
+        "thinking_start_token",
+        "thinking_end_token",
+        "tools",
+        "chat_template",
+    }
+)
+
+
+def filter_chat_template_kwargs(values: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        key: value
+        for key, value in values.items()
+        if key in CHAT_TEMPLATE_KWARG_KEYS and value is not None
+    }
 
 
 def extract_text_from_content(content: Any) -> str:
@@ -653,6 +671,7 @@ def apply_chat_template(
     Returns:
         Formatted messages or chat template
     """
+    kwargs = filter_chat_template_kwargs(kwargs)
     config = config if isinstance(config, dict) else config.__dict__
     model_type = config["model_type"]
 

@@ -190,20 +190,23 @@ mlx_vlm.server --model <hf_repo_or_local_path> --adapter-path <adapter_path>
 
 # With trust remote code enabled (required for some models)
 mlx_vlm.server --trust-remote-code
+
+# Set server-wide generation defaults for requests that omit them
+mlx_vlm.server --max-tokens 512 --temperature 0.7 --top-p 0.95 --top-k 40 --min-p 0.05
 ```
 
 #### Server Options
 
-- `--model`: Preload a model at server startup, accepts a Hugging Face repo ID or local path (optional, loads lazily on first request if omitted)
+- `--model`: Preload a model at server startup from a Hugging Face repo ID or local path, and use it as the default for requests that omit `model`
 - `--adapter-path`: Path for adapter weights to use with the preloaded model
 - `--host`: Host address (default: `0.0.0.0`)
 - `--port`: Port number (default: `8080`)
-- `--trust-remote-code`: Trust remote code when loading models from Hugging Face Hub
+- `--trust-remote-code`: Trust remote code when loading models from Hugging Face Hub. You can also set `MLX_TRUST_REMOTE_CODE=true`
+- `--max-tokens`: Default max tokens for requests that omit `max_tokens` or `max_output_tokens`
+- `--temperature` / `--temp`: Default sampling temperature for requests that omit `temperature`
+- `--top-p`, `--top-k`, `--min-p`: Default sampler settings for requests that omit them
 
-You can also set trust remote code via environment variable:
-```sh
-MLX_TRUST_REMOTE_CODE=true mlx_vlm.server
-```
+Requests override server defaults. Server defaults override the built-in generation defaults.
 
 The server provides multiple endpoints for different use cases and supports dynamic model loading/unloading with caching (one model at a time).
 

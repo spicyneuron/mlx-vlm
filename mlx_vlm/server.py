@@ -18,75 +18,88 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from huggingface_hub import scan_cache_dir
 from mlx_lm.tokenizer_utils import _infer_tool_parser
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field
 from typing_extensions import Required, TypeAlias, TypedDict
 
 from .generate import (
-    DEFAULT_KV_GROUP_SIZE,
-    DEFAULT_MAX_TOKENS,
-    DEFAULT_MODEL_PATH,
-    DEFAULT_PREFILL_STEP_SIZE,
-    DEFAULT_QUANTIZED_KV_START,
     DEFAULT_SEED,
-    DEFAULT_TEMPERATURE,
-    DEFAULT_TOP_P,
+    filter_generation_config,
     generate,
-    normalize_resize_shape,
+    resolve_generation_config,
     stream_generate,
 )
-from .prompt_utils import apply_chat_template
+from .prompt_utils import apply_chat_template, filter_chat_template_kwargs
 from .utils import load
 from .version import __version__
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
+ResizeShapeInput: TypeAlias = tuple[int] | tuple[int, int]
 
 
-def get_prefill_step_size():
-    return int(os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE))
 
-
-def get_quantized_kv_bits(model: str):
-    kv_bits = int(os.environ.get("KV_BITS", 0))
-    if kv_bits == 0:
-        return None
-    if "qat" in model:
-        print(
-            f"Model {model} is quantization aware, (Rotating)KVCache cache will not be quantized to {kv_bits} bits, use --max-kv-size [tokens] instead."
+def resolve_load_config(
+    request_model: Optional[str],
+    request_adapter_path: Optional[str],
+    server_config: dict[str, Any],
+) -> tuple[str, Optional[str]]:
+    model_name = request_model or server_config["model"]
+    if model_name is None:
+        raise HTTPException(
+            status_code=400,
+            detail="No model specified. Pass a model in the request or start the server with --model.",
         )
-        return None
-    return kv_bits
+
+    adapter_path = request_adapter_path
+    if adapter_path is None and (
+        request_model is None or model_name == server_config["model"]
+    ):
+        adapter_path = server_config["adapter_path"]
+
+    return model_name, adapter_path
 
 
-def get_kv_group_size():
-    return int(os.environ.get("KV_GROUP_SIZE", DEFAULT_KV_GROUP_SIZE))
 
+def get_model(model_path: str, adapter_path: Optional[str] = None):
+    global model_cache
+    trust_remote_code = app.state.server_config["trust_remote_code"]
+    cache_key = (model_path, adapter_path, trust_remote_code)
 
-def get_max_kv_size(model: str):
-    max_kv_tokens = int(os.environ.get("MAX_KV_SIZE", 0))
-    if max_kv_tokens == 0:
-        return None
-    if get_quantized_kv_bits(model) is not None:
-        print(
-            f"Model {model} uses QuantizedKVCache cache, can't set max KV size, use --kv-bits [bits] instead."
-        )
-        return None
-    return max_kv_tokens
+    if model_cache.get("cache_key") == cache_key:
+        return model_cache["model"], model_cache["processor"], model_cache["config"]
 
+    if model_cache:
+        unload_model_sync()
 
-def get_quantized_kv_start():
-    return int(os.environ.get("QUANTIZED_KV_START", DEFAULT_QUANTIZED_KV_START))
+    try:
+        print(f"Loading model: {model_path}" + (f", adapter: {adapter_path}" if adapter_path else ""))
+        model, processor = load(model_path, adapter_path, trust_remote_code=trust_remote_code)
+        config = model.config
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to load model: {e}")
+
+    model_cache = {
+        "cache_key": cache_key,
+        "model_path": model_path,
+        "adapter_path": adapter_path,
+        "model": model,
+        "processor": processor,
+        "config": config,
+    }
+    return model, processor, config
 
 
 @asynccontextmanager
-async def lifespan(app):
+async def lifespan(server_app):
     # Startup
-    model_path = os.environ.get("PRELOAD_MODEL")
-    adapter_path = os.environ.get("PRELOAD_ADAPTER") or None
+    server_config = server_app.state.server_config
+    model_path = server_config["model"]
+    adapter_path = server_config["adapter_path"]
     if model_path:
         try:
             print(f"Preloading model: {model_path}")
-            get_cached_model(model_path, adapter_path)
+            get_model(model_path, adapter_path)
         except Exception as e:
             print(f"Failed to preload model: {e}")
             print("Server will continue without a preloaded model.")
@@ -100,6 +113,7 @@ app = FastAPI(
     version=__version__,
     lifespan=lifespan,
 )
+app.state.server_config = {"model": None, "adapter_path": None, "trust_remote_code": False, "generation": {}}
 
 app.add_middleware(
     CORSMiddleware,
@@ -117,70 +131,85 @@ model_cache = {}
 
 
 class FlexibleBaseModel(BaseModel):
-    """Base model that ignores/accepts any unknown OpenAI SDK fields."""
+    """Base model that ignores unknown OpenAI SDK fields."""
 
-    model_config = ConfigDict(extra="allow")
-
-    def dump_kwargs(self, *fields: str) -> dict[str, Any]:
-        return self.model_dump(include=set(fields), exclude_none=True)
+    model_config = ConfigDict(extra="ignore")
 
 
-def load_model_resources(model_path: str, adapter_path: Optional[str]):
-    """
-    Loads model, processor, and config based on paths.
-    Handles potential loading errors.
-    """
-    try:
-        print(f"Loading model from: {model_path}")
-        if adapter_path:
-            print(f"Loading adapter from: {adapter_path}")
-        # Use the load function from utils.py which handles path resolution and loading
-        trust_remote_code = (
-            os.environ.get("MLX_TRUST_REMOTE_CODE", "false").lower() == "true"
-        )
-        model, processor = load(
-            model_path, adapter_path, trust_remote_code=trust_remote_code
-        )
-        config = model.config
-        print("Model and processor loaded successfully.")
-        return model, processor, config
-    except Exception as e:
-        print(f"Error loading model {model_path}: {e}")
-        traceback.print_exc()  # Print detailed traceback for debugging
-        raise HTTPException(status_code=500, detail=f"Failed to load model: {e}")
+class CommonRequest(FlexibleBaseModel):
+    model: Optional[str] = Field(
+        None,
+        description="The model to use for generation.",
+    )
+    stream: bool = Field(
+        False,
+        description="Whether to stream the response chunk by chunk.",
+    )
+    temperature: Optional[float] = Field(
+        None,
+        description="Temperature for sampling.",
+    )
+    top_p: Optional[float] = Field(
+        None,
+        description="Top-p sampling.",
+    )
+    top_k: Optional[int] = Field(
+        None,
+        description="Top-k sampling cutoff.",
+    )
+    min_p: Optional[float] = Field(
+        None,
+        description="Min-p sampling threshold.",
+    )
+    repetition_penalty: Optional[float] = Field(
+        None,
+        description="Penalty applied to repeated tokens.",
+    )
+    logit_bias: Optional[dict[int, float]] = Field(
+        None,
+        description="Additive logit bias keyed by token id.",
+    )
+    resize_shape: Optional[ResizeShapeInput] = Field(
+        None,
+        description="Resize shape for the image. Provide one integer for a square resize or two integers for (height, width).",
+    )
+    prefill_step_size: Optional[int] = Field(
+        None,
+        description="Number of tokens to process per prefill step.",
+    )
+    kv_bits: Optional[int] = Field(
+        None,
+        description="Number of bits for KV cache quantization.",
+    )
+    kv_group_size: Optional[int] = Field(
+        None,
+        description="Group size for KV cache quantization.",
+    )
+    max_kv_size: Optional[int] = Field(
+        None,
+        description="Maximum KV size for the prompt cache (tokens).",
+    )
+    quantized_kv_start: Optional[int] = Field(
+        None,
+        description="Start index for the quantized KV cache.",
+    )
+    enable_thinking: Optional[bool] = Field(
+        None,
+        description="Enable thinking mode in the chat template.",
+    )
+    thinking_budget: Optional[int] = Field(
+        None,
+        description="Maximum number of thinking tokens before forcing the end token.",
+    )
+    thinking_start_token: Optional[str] = Field(
+        None,
+        description="Token that marks the start of a thinking block.",
+    )
+    thinking_end_token: Optional[str] = Field(
+        None,
+        description="Token that marks the end of a thinking block.",
+    )
 
-
-def get_cached_model(model_path: str, adapter_path: Optional[str] = None):
-    """
-    Factory function to get or load the appropriate model resources from cache or by loading.
-    """
-    global model_cache
-
-    cache_key = (model_path, adapter_path)
-
-    # Return from cache if already loaded and matches the requested paths
-    if model_cache.get("cache_key") == cache_key:
-        print(f"Using cached model: {model_path}, Adapter: {adapter_path}")
-        return model_cache["model"], model_cache["processor"], model_cache["config"]
-
-    # If cache exists but doesn't match, clear it
-    if model_cache:
-        print("New model request, clearing existing cache...")
-        unload_model_sync()  # Use a synchronous version for internal call
-
-    # Load the model resources
-    model, processor, config = load_model_resources(model_path, adapter_path)
-
-    model_cache = {
-        "cache_key": cache_key,
-        "model_path": model_path,
-        "adapter_path": adapter_path,
-        "model": model,
-        "processor": processor,
-        "config": config,
-    }
-
-    return model, processor, config
 
 
 # Synchronous unload function for internal use
@@ -261,8 +290,6 @@ ResponseInputContentParam: TypeAlias = Union[
     ResponseInputAudioParam,
 ]
 
-ResizeShapeInput: TypeAlias = tuple[int] | tuple[int, int]
-
 ResponseInputMessageContentListParam: TypeAlias = List[ResponseInputContentParam]
 
 
@@ -291,69 +318,7 @@ class ChatMessage(FlexibleBaseModel):
     tool_calls: List = []
 
 
-class GenerationParams(FlexibleBaseModel):
-    temperature: float = Field(
-        DEFAULT_TEMPERATURE,
-        description="Temperature for sampling.",
-    )
-    top_p: float = Field(
-        DEFAULT_TOP_P,
-        description="Top-p sampling.",
-    )
-    top_k: Optional[int] = Field(
-        None,
-        description="Top-k sampling cutoff.",
-    )
-    min_p: Optional[float] = Field(
-        None,
-        description="Min-p sampling threshold.",
-    )
-    repetition_penalty: Optional[float] = Field(
-        None, description="Penalty applied to repeated tokens."
-    )
-    logit_bias: Optional[dict[int, float]] = Field(
-        None, description="Additive logit bias keyed by token id."
-    )
-
-    def shared_generation_kwargs(self) -> dict[str, Any]:
-        return self.dump_kwargs(
-            "temperature",
-            "top_p",
-            "top_k",
-            "min_p",
-            "repetition_penalty",
-            "logit_bias",
-        )
-
-
-class TemplateParams(FlexibleBaseModel):
-    enable_thinking: Optional[bool] = Field(
-        None,
-        description="Enable thinking mode in the chat template.",
-    )
-    thinking_budget: Optional[int] = Field(
-        None,
-        description="Maximum number of thinking tokens before forcing the end token.",
-    )
-    thinking_start_token: Optional[str] = Field(
-        None,
-        description="Token that marks the start of a thinking block.",
-    )
-    thinking_end_token: Optional[str] = Field(
-        None,
-        description="Token that marks the end of a thinking block.",
-    )
-
-    def template_kwargs(self) -> dict[str, Any]:
-        return self.dump_kwargs(
-            "enable_thinking",
-            "thinking_budget",
-            "thinking_start_token",
-            "thinking_end_token",
-        )
-
-
-class OpenAIRequest(GenerationParams, TemplateParams):
+class OpenAIRequest(CommonRequest):
     """
     OpenAI-compatible request structure.
     Using this structure : https://github.com/openai/openai-python/blob/main/src/openai/resources/responses/responses.py
@@ -362,19 +327,10 @@ class OpenAIRequest(GenerationParams, TemplateParams):
     input: Union[str, List[ChatMessage]] = Field(
         ..., description="Input text or list of chat messages."
     )
-    model: str = Field(..., description="The model to use for generation.")
-    max_output_tokens: int = Field(
-        DEFAULT_MAX_TOKENS,
+    max_output_tokens: Optional[int] = Field(
+        None,
         description="Maximum number of tokens to generate.",
     )
-    stream: bool = Field(
-        False, description="Whether to stream the response chunk by chunk."
-    )
-
-    def generation_kwargs(self) -> dict[str, Any]:
-        kwargs = self.dump_kwargs("max_output_tokens")
-        kwargs["max_tokens"] = kwargs.pop("max_output_tokens")
-        return {**kwargs, **self.shared_generation_kwargs()}
 
 
 class OpenAIUsage(BaseModel):
@@ -534,46 +490,6 @@ StreamEvent = Union[
 # Models for /chat/completion endpoint
 
 
-class VLMRequest(GenerationParams, TemplateParams):
-    model: str = Field(
-        DEFAULT_MODEL_PATH,
-        description="The path to the local model directory or Hugging Face repo.",
-    )
-    adapter_path: Optional[str] = Field(
-        None, description="The path to the adapter weights."
-    )
-    max_tokens: int = Field(
-        DEFAULT_MAX_TOKENS,
-        description="Maximum number of tokens to generate.",
-    )
-    seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
-    resize_shape: Optional[ResizeShapeInput] = Field(
-        None,
-        description="Resize shape for the image. Provide one integer for a square resize or two integers for (height, width).",
-    )
-
-    @field_validator("resize_shape", mode="before")
-    @classmethod
-    def normalize_resize_shape_field(cls, value):
-        return normalize_resize_shape(value)
-
-    def generation_kwargs(self) -> dict[str, Any]:
-        return {
-            **self.dump_kwargs("max_tokens", "resize_shape"),
-            **self.shared_generation_kwargs(),
-        }
-
-
-class GenerationRequest(VLMRequest):
-    """
-    Inherits from VLMRequest and adds additional fields for the generation request.
-    """
-
-    stream: bool = Field(
-        False, description="Whether to stream the response chunk by chunk."
-    )
-
-
 class UsageStats(OpenAIUsage):
     """
     Inherits from OpenAIUsage and adds additional fields for usage statistics.
@@ -588,8 +504,21 @@ class UsageStats(OpenAIUsage):
     )
 
 
-class ChatRequest(GenerationRequest):
+class ChatRequest(CommonRequest):
     messages: List[ChatMessage]
+    adapter_path: Optional[str] = Field(
+        None,
+        description="The path to the adapter weights.",
+    )
+    max_tokens: Optional[int] = Field(
+        None,
+        description="Maximum number of tokens to generate.",
+    )
+    seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
+    tools: Optional[List[Any]] = Field(
+        None,
+        description="Available tools for the model to call.",
+    )
 
 
 class ChatChoice(BaseModel):
@@ -618,19 +547,109 @@ class ChatStreamChunk(BaseModel):
     usage: Optional[UsageStats]
 
 
-def build_generation_kwargs(
-    request: Any,
-    template_kwargs: dict[str, Any],
-) -> dict[str, Any]:
-    return {
-        "prefill_step_size": get_prefill_step_size(),
-        "kv_bits": get_quantized_kv_bits(request.model),
-        "kv_group_size": get_kv_group_size(),
-        "max_kv_size": get_max_kv_size(request.model),
-        "quantized_kv_start": get_quantized_kv_start(),
-        **request.generation_kwargs(),
-        **template_kwargs,
-    }
+def parse_responses_input(
+    input_data: Union[str, List[ChatMessage]],
+) -> tuple[list[dict[str, Any]], list[str], Optional[str]]:
+    chat_messages = []
+    images = []
+    instructions = None
+
+    if input_data in ("", []):
+        print("no input")
+        raise HTTPException(status_code=400, detail="Missing input.")
+
+    if isinstance(input_data, str):
+        chat_messages.append({"role": "user", "content": input_data})
+    elif isinstance(input_data, list):
+        for message in input_data:
+            if not isinstance(message, ChatMessage):
+                print("not a ChatMessage")
+                raise HTTPException(status_code=400, detail="Invalid input format.")
+
+            if message.content is None:
+                chat_messages.append({"role": message.role, "content": ""})
+                continue
+
+            if isinstance(message.content, str):
+                chat_messages.append(
+                    {"role": message.role, "content": message.content}
+                )
+                if message.role == "system":
+                    instructions = message.content
+                continue
+
+            if not isinstance(message.content, list):
+                print("Invalid message content format.")
+                raise HTTPException(status_code=400, detail="Invalid input format.")
+
+            for item in message.content:
+                if not isinstance(item, dict):
+                    print(f"Invalid message content item format: {item}")
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Missing type in input item.",
+                    )
+
+                if item["type"] == "input_text":
+                    chat_messages.append(
+                        {
+                            "role": message.role,
+                            "content": item["text"],
+                        }
+                    )
+                    if message.role == "system":
+                        instructions = item["text"]
+                elif item["type"] == "input_image":
+                    images.append(item["image_url"])
+                else:
+                    print(f"invalid input item type: {item['type']}")
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Invalid input item type.",
+                    )
+    else:
+        print("neither string not list")
+        raise HTTPException(status_code=400, detail="Invalid input format.")
+
+    if not chat_messages and not images:
+        print("no input")
+        raise HTTPException(status_code=400, detail="Missing input.")
+
+    return chat_messages, images, instructions
+
+
+def parse_chat_messages(
+    messages: List[ChatMessage],
+) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+    images = []
+    audio = []
+    processed_messages = []
+
+    for message in messages:
+        if message.content is None:
+            processed_messages.append({"role": message.role, "content": ""})
+        elif isinstance(message.content, str):
+            processed_messages.append(
+                {"role": message.role, "content": message.content}
+            )
+        elif isinstance(message.content, list):
+            text_content = ""
+            for item in message.content:
+                if isinstance(item, dict):
+                    if message.role == "user":
+                        if item["type"] == "input_image":
+                            images.append(item["image_url"])
+                        elif item["type"] == "image_url":
+                            images.append(item["image_url"]["url"])
+                        elif item["type"] == "input_audio":
+                            audio.append(item["input_audio"]["data"])
+                    if item["type"] in ("text", "input_text"):
+                        text_content = item.get("text", "")
+            processed_messages.append(
+                {"role": message.role, "content": text_content}
+            )
+
+    return processed_messages, images, audio
 
 
 def process_tool_calls(model_output: str, tool_module, tools):
@@ -694,6 +713,153 @@ class ModelsResponse(BaseModel):
 # OpenAI compatile endpoints
 
 
+def sse_response(gen):
+    return StreamingResponse(
+        gen,
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
+
+
+async def _stream_responses(
+    model, processor, prompt, images, generation_config,
+    model_name, response_id, message_id, generated_at, instructions,
+):
+    try:
+        base_response = OpenAIResponse(
+            id=response_id,
+            object="response",
+            created_at=int(generated_at),
+            status="in_progress",
+            instructions=instructions,
+            max_output_tokens=generation_config["max_tokens"],
+            model=model_name,
+            output=[],
+            output_text="",
+            temperature=generation_config["temperature"],
+            top_p=generation_config["top_p"],
+            usage={
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            },
+        )
+
+        yield f"event: response.created\ndata: {ResponseCreatedEvent(type='response.created', response=base_response).model_dump_json()}\n\n"
+        yield f"event: response.in_progress\ndata: {ResponseInProgressEvent(type='response.in_progress', response=base_response).model_dump_json()}\n\n"
+
+        message_item = MessageItem(
+            id=message_id, type="message", status="in_progress", role="assistant", content=[],
+        )
+        yield f"event: response.output_item.added\ndata: {ResponseOutputItemAddedEvent(type='response.output_item.added', output_index=0, item=message_item).model_dump_json()}\n\n"
+
+        content_part = ContentPartOutputText(type="output_text", text="", annotations=[])
+        yield f"event: response.content_part.added\ndata: {ResponseContentPartAddedEvent(type='response.content_part.added', item_id=message_id, output_index=0, content_index=0, part=content_part).model_dump_json()}\n\n"
+
+        full_text = ""
+        for chunk in stream_generate(model=model, processor=processor, prompt=prompt, image=images, **generation_config):
+            if chunk is None or not hasattr(chunk, "text"):
+                continue
+            full_text += chunk.text
+            usage_stats = {"input_tokens": chunk.prompt_tokens, "output_tokens": chunk.generation_tokens}
+            yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=chunk.text).model_dump_json()}\n\n"
+
+        yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=0, content_index=0, text=full_text).model_dump_json()}\n\n"
+
+        final_content_part = ContentPartOutputText(type="output_text", text=full_text, annotations=[])
+        yield f"event: response.content_part.done\ndata: {ResponseContentPartDoneEvent(type='response.content_part.done', item_id=message_id, output_index=0, content_index=0, part=final_content_part).model_dump_json()}\n\n"
+
+        final_message_item = MessageItem(
+            id=message_id, type="message", status="completed", role="assistant", content=[final_content_part],
+        )
+        yield f"event: response.output_item.done\ndata: {ResponseOutputItemDoneEvent(type='response.output_item.done', output_index=0, item=final_message_item).model_dump_json()}\n\n"
+
+        completed_response = base_response.model_copy(
+            update={
+                "status": "completed",
+                "output": [final_message_item],
+                "usage": {
+                    "input_tokens": usage_stats["input_tokens"],
+                    "output_tokens": usage_stats["output_tokens"],
+                    "total_tokens": usage_stats["input_tokens"] + usage_stats["output_tokens"],
+                },
+            }
+        )
+        yield f"event: response.completed\ndata: {ResponseCompletedEvent(type='response.completed', response=completed_response).model_dump_json()}\n\n"
+
+    except Exception as e:
+        print(f"Error during stream generation: {e}")
+        traceback.print_exc()
+        yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+    finally:
+        mx.clear_cache()
+        gc.collect()
+        print("Stream finished, cleared cache.")
+
+
+async def _stream_chat(
+    model, processor, prompt, images, audio, generation_config,
+    model_name, tool_parser_type, tool_module, tools,
+):
+    try:
+        token_gen = stream_generate(
+            model=model, processor=processor, prompt=prompt,
+            image=images, audio=audio, **generation_config,
+        )
+
+        output_text = ""
+        request_id = f"chatcmpl-{uuid.uuid4()}"
+        for chunk in token_gen:
+            if chunk is None or not hasattr(chunk, "text"):
+                print("Warning: Received unexpected chunk format:", chunk)
+                continue
+
+            output_text += chunk.text
+            usage_stats = {
+                "input_tokens": chunk.prompt_tokens,
+                "output_tokens": chunk.generation_tokens,
+                "total_tokens": chunk.prompt_tokens + chunk.generation_tokens,
+                "prompt_tps": chunk.prompt_tps,
+                "generation_tps": chunk.generation_tps,
+                "peak_memory": chunk.peak_memory,
+            }
+            choices = [ChatStreamChoice(delta=ChatMessage(role="assistant", content=chunk.text))]
+            chunk_data = ChatStreamChunk(
+                id=request_id, created=int(time.time()), model=model_name,
+                usage=usage_stats, choices=choices,
+            )
+            yield f"data: {chunk_data.model_dump_json()}\n\n"
+
+        if tool_parser_type is not None:
+            tool_calls = process_tool_calls(model_output=output_text, tool_module=tool_module, tools=tools)
+        else:
+            tool_calls = {"calls": []}
+
+        choices = [
+            ChatStreamChoice(
+                finish_reason="stop",
+                delta=ChatMessage(role="assistant", content="", tool_calls=tool_calls["calls"]),
+            )
+        ]
+        chunk_data = ChatStreamChunk(
+            id=request_id, created=int(time.time()), model=model_name,
+            usage=usage_stats, choices=choices,
+        )
+        yield f"data: {chunk_data.model_dump_json()}\n\n"
+        yield "data: [DONE]\n\n"
+
+    except Exception as e:
+        print(f"Error during stream generation: {e}")
+        traceback.print_exc()
+        yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+    finally:
+        mx.clear_cache()
+        gc.collect()
+        print("Stream finished, cleared cache.")
+
+
 @app.post("/responses")
 @app.post("/v1/responses", include_in_schema=False)
 async def responses_endpoint(openai_request: OpenAIRequest):
@@ -752,218 +918,48 @@ async def responses_endpoint(openai_request: OpenAIRequest):
     """
 
     try:
-        # Get model, processor, config - loading if necessary
-        model, processor, config = get_cached_model(openai_request.model)
+        chat_messages, images, instructions = parse_responses_input(openai_request.input)
 
-        chat_messages = []
-        images = []
-        instructions = None
-        if openai_request.input:
-            if isinstance(openai_request.input, str):
-                # If input is a string, treat it as a single text message
-                chat_messages.append({"role": "user", "content": openai_request.input})
-            elif isinstance(openai_request.input, list):
-                # If input is a list, treat it as a series of chat messages
-                for message in openai_request.input:
-                    if isinstance(message, ChatMessage):
-                        if message.content is None:
-                            chat_messages.append({"role": message.role, "content": ""})
-                        elif isinstance(message.content, str):
-                            chat_messages.append(
-                                {"role": message.role, "content": message.content}
-                            )
-                            if message.role == "system":
-                                instructions = message.content
-                        elif isinstance(message.content, list):
-                            # Handle list of content items
-                            for item in message.content:
-                                if isinstance(item, dict):
-                                    if item["type"] == "input_text":
-                                        chat_messages.append(
-                                            {
-                                                "role": message.role,
-                                                "content": item["text"],
-                                            }
-                                        )
-                                        if message.role == "system":
-                                            instructions = item["text"]
-                                    # examples for multiple images (https://platform.openai.com/docs/guides/images?api-mode=responses)
-                                    elif item["type"] == "input_image":
-                                        images.append(item["image_url"])
-                                    else:
-                                        print(
-                                            f"invalid input item type: {item['type']}"
-                                        )
-                                        raise HTTPException(
-                                            status_code=400,
-                                            detail="Invalid input item type.",
-                                        )
-                                else:
-                                    print(
-                                        f"Invalid message content item format: {item}"
-                                    )
-                                    raise HTTPException(
-                                        status_code=400,
-                                        detail="Missing type in input item.",
-                                    )
-                        else:
-                            print("Invalid message content format.")
-                            raise HTTPException(
-                                status_code=400, detail="Invalid input format."
-                            )
-                    else:
-                        print("not a ChatMessage")
-                        raise HTTPException(
-                            status_code=400, detail="Invalid input format."
-                        )
-            else:
-                print("neither string not list")
-                raise HTTPException(status_code=400, detail="Invalid input format.")
+        server_config = app.state.server_config
+        model_name, adapter_path = resolve_load_config(openai_request.model, None, server_config)
 
-        else:
-            print("no input")
-            raise HTTPException(status_code=400, detail="Missing input.")
+        raw = openai_request.model_dump(exclude_none=True, exclude_unset=True)
+        request_gen = filter_generation_config(raw)
+        if openai_request.max_output_tokens is not None:
+            request_gen["max_tokens"] = openai_request.max_output_tokens
+        merged = {**server_config["generation"], **request_gen}
+        try:
+            generation_config = resolve_generation_config(merged)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if "qat" in model_name and "kv_bits" in generation_config:
+            print(f"Model {model_name} is QAT; kv_bits ignored. Use --max-kv-size instead.")
+            generation_config.pop("kv_bits")
+            generation_config.pop("max_kv_size", None)
+        template_kwargs = filter_chat_template_kwargs({**merged, **raw})
 
-        template_kwargs = openai_request.template_kwargs()
-        formatted_prompt = apply_chat_template(
-            processor,
-            config,
-            chat_messages,
-            num_images=len(images),
-            **template_kwargs,
-        )
-        generation_kwargs = build_generation_kwargs(openai_request, template_kwargs)
+        if len(images) > MAX_IMAGES:
+            raise HTTPException(status_code=400, detail=f"Too many images. Maximum supported is {MAX_IMAGES}.")
+
+        model, processor, config = get_model(model_name, adapter_path)
+        try:
+            formatted_prompt = apply_chat_template(
+                processor, config, chat_messages,
+                num_images=len(images), num_audios=0,
+                **template_kwargs,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         generated_at = datetime.now().timestamp()
         response_id = f"resp_{uuid.uuid4().hex}"
         message_id = f"msg_{uuid.uuid4().hex}"
 
         if openai_request.stream:
-            # Streaming response
-            async def stream_generator():
-                token_iterator = None
-                try:
-                    # Create base response object (to match the openai pipeline)
-                    base_response = OpenAIResponse(
-                        id=response_id,
-                        object="response",
-                        created_at=int(generated_at),
-                        status="in_progress",
-                        instructions=instructions,
-                        max_output_tokens=openai_request.max_output_tokens,
-                        model=openai_request.model,
-                        output=[],
-                        output_text="",
-                        temperature=openai_request.temperature,
-                        top_p=openai_request.top_p,
-                        usage={
-                            "input_tokens": 0,  # get prompt tokens
-                            "output_tokens": 0,
-                            "total_tokens": 0,
-                        },
-                    )
-
-                    # Send response.created event  (to match the openai pipeline)
-                    yield f"event: response.created\ndata: {ResponseCreatedEvent(type='response.created', response=base_response).model_dump_json()}\n\n"
-
-                    # Send response.in_progress event  (to match the openai pipeline)
-                    yield f"event: response.in_progress\ndata: {ResponseInProgressEvent(type='response.in_progress', response=base_response).model_dump_json()}\n\n"
-
-                    # Send response.output_item.added event  (to match the openai pipeline)
-                    message_item = MessageItem(
-                        id=message_id,
-                        type="message",
-                        status="in_progress",
-                        role="assistant",
-                        content=[],
-                    )
-                    yield f"event: response.output_item.added\ndata: {ResponseOutputItemAddedEvent(type='response.output_item.added', output_index=0, item=message_item).model_dump_json()}\n\n"
-
-                    # Send response.content_part.added event
-                    content_part = ContentPartOutputText(
-                        type="output_text", text="", annotations=[]
-                    )
-                    yield f"event: response.content_part.added\ndata: {ResponseContentPartAddedEvent(type='response.content_part.added', item_id=message_id, output_index=0, content_index=0, part=content_part).model_dump_json()}\n\n"
-
-                    # Stream text deltas
-                    token_iterator = stream_generate(
-                        model=model,
-                        processor=processor,
-                        prompt=formatted_prompt,
-                        image=images,
-                        **generation_kwargs,
-                    )
-
-                    full_text = ""
-                    for chunk in token_iterator:
-                        if chunk is None or not hasattr(chunk, "text"):
-                            continue
-
-                        delta = chunk.text
-                        full_text += delta
-
-                        usage_stats = {
-                            "input_tokens": chunk.prompt_tokens,
-                            "output_tokens": chunk.generation_tokens,
-                        }
-
-                        # Send response.output_text.delta event
-                        yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
-
-                    # Send response.output_text.done event (to match the openai pipeline)
-                    yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=0, content_index=0, text=full_text).model_dump_json()}\n\n"
-
-                    # Send response.content_part.done event (to match the openai pipeline)
-                    final_content_part = ContentPartOutputText(
-                        type="output_text", text=full_text, annotations=[]
-                    )
-                    yield f"event: response.content_part.done\ndata: {ResponseContentPartDoneEvent(type='response.content_part.done', item_id=message_id, output_index=0, content_index=0, part=final_content_part).model_dump_json()}\n\n"
-
-                    # Send response.output_item.done event (to match the openai pipeline)
-                    final_message_item = MessageItem(
-                        id=message_id,
-                        type="message",
-                        status="completed",
-                        role="assistant",
-                        content=[final_content_part],
-                    )
-                    yield f"event: response.output_item.done\ndata: {ResponseOutputItemDoneEvent(type='response.output_item.done', output_index=0, item=final_message_item).model_dump_json()}\n\n"
-
-                    # Send response.completed event (to match the openai pipeline)
-                    completed_response = base_response.model_copy(
-                        update={
-                            "status": "completed",
-                            "output": [final_message_item],
-                            "usage": {
-                                "input_tokens": usage_stats["input_tokens"],
-                                "output_tokens": usage_stats["output_tokens"],
-                                "total_tokens": usage_stats["input_tokens"]
-                                + usage_stats["output_tokens"],
-                            },
-                        }
-                    )
-                    yield f"event: response.completed\ndata: {ResponseCompletedEvent(type='response.completed', response=completed_response).model_dump_json()}\n\n"
-
-                except Exception as e:
-                    print(f"Error during stream generation: {e}")
-                    traceback.print_exc()
-                    error_data = json.dumps({"error": str(e)})
-                    yield f"data: {error_data}\n\n"
-
-                finally:
-                    mx.clear_cache()
-                    gc.collect()
-                    print("Stream finished, cleared cache.")
-
-            return StreamingResponse(
-                stream_generator(),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
-                },
-            )
+            return sse_response(_stream_responses(
+                model, processor, formatted_prompt, images, generation_config,
+                model_name, response_id, message_id, generated_at, instructions,
+            ))
 
         else:
             # Non-streaming response
@@ -975,7 +971,7 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                     prompt=formatted_prompt,
                     image=images,
                     verbose=False,  # stats are passed in the response
-                    **generation_kwargs,
+                    **generation_config,
                 )
                 # Clean up resources
                 mx.clear_cache()
@@ -988,8 +984,8 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                     created_at=int(generated_at),
                     status="completed",
                     instructions=instructions,
-                    max_output_tokens=openai_request.max_output_tokens,
-                    model=openai_request.model,
+                    max_output_tokens=generation_config["max_tokens"],
+                    model=model_name,
                     output=[
                         {
                             "role": "assistant",
@@ -1002,8 +998,8 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                         }
                     ],
                     output_text=result.text,
-                    temperature=openai_request.temperature,
-                    top_p=openai_request.top_p,
+                    temperature=generation_config["temperature"],
+                    top_p=generation_config["top_p"],
                     usage={
                         "input_tokens": result.prompt_tokens,
                         "output_tokens": result.generation_tokens,
@@ -1037,7 +1033,9 @@ async def responses_endpoint(openai_request: OpenAIRequest):
     "/chat/completions", response_model=None
 )  # Response model handled dynamically based on stream flag
 @app.post("/v1/chat/completions", response_model=None, include_in_schema=False)
-async def chat_completions_endpoint(request: ChatRequest):
+async def chat_completions_endpoint(
+    request: ChatRequest,
+):
     """
     Generate text based on a prompt and optional images.
     Prompt must be a list of chat messages, including system, user, and assistant messages.
@@ -1046,42 +1044,39 @@ async def chat_completions_endpoint(request: ChatRequest):
     """
 
     try:
-        # Get model, processor, config - loading if necessary
-        model, processor, config = get_cached_model(request.model, request.adapter_path)
+        processed_messages, images, audio = parse_chat_messages(request.messages)
 
-        images = []
-        audio = []
-        processed_messages = []
-        for message in request.messages:
-            if message.content is None:
-                processed_messages.append({"role": message.role, "content": ""})
-            elif isinstance(message.content, str):
-                processed_messages.append(
-                    {"role": message.role, "content": message.content}
-                )
-            elif isinstance(message.content, list):
-                text_content = ""
-                for item in message.content:
-                    if isinstance(item, dict):
-                        # Only extract images/audio from user messages
-                        if message.role == "user":
-                            if item["type"] == "input_image":
-                                images.append(item["image_url"])
-                            elif item["type"] == "image_url":
-                                images.append(item["image_url"]["url"])
-                            elif item["type"] == "input_audio":
-                                audio.append(item["input_audio"]["data"])
-                        if item["type"] in ("text", "input_text"):
-                            text_content = item.get("text", "")
-                processed_messages.append(
-                    {"role": message.role, "content": text_content}
-                )
+        server_config = app.state.server_config
+        model_name, adapter_path = resolve_load_config(request.model, request.adapter_path, server_config)
 
-        tools = None
-        if hasattr(request, "tools"):
-            tools = request.tools
+        raw = request.model_dump(exclude_none=True, exclude_unset=True)
+        request_gen = filter_generation_config(raw)
+        merged = {**server_config["generation"], **request_gen}
+        try:
+            generation_config = resolve_generation_config(merged)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if "qat" in model_name and "kv_bits" in generation_config:
+            print(f"Model {model_name} is QAT; kv_bits ignored. Use --max-kv-size instead.")
+            generation_config.pop("kv_bits")
+            generation_config.pop("max_kv_size", None)
+        template_kwargs = filter_chat_template_kwargs({**merged, **raw})
+
+        if len(images) > MAX_IMAGES:
+            raise HTTPException(status_code=400, detail=f"Too many images. Maximum supported is {MAX_IMAGES}.")
+
+        model, processor, config = get_model(model_name, adapter_path)
+        try:
+            formatted_prompt = apply_chat_template(
+                processor, config, processed_messages,
+                num_images=len(images), num_audios=len(audio),
+                **template_kwargs,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         tool_parser_type = None
+        tool_module = None
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
@@ -1091,121 +1086,12 @@ async def chat_completions_endpoint(request: ChatRequest):
                 tool_module = importlib.import_module(
                     f"mlx_lm.tool_parsers.{tool_parser_type}"
                 )
-        template_kwargs = request.template_kwargs()
-        formatted_prompt = apply_chat_template(
-            processor,
-            config,
-            processed_messages,
-            num_images=len(images),
-            num_audios=len(audio),
-            tools=tools,
-            **template_kwargs,
-        )
-        generation_kwargs = build_generation_kwargs(request, template_kwargs)
 
         if request.stream:
-            # Streaming response
-            async def stream_generator():
-                token_iterator = None
-                try:
-                    # Use stream_generate from utils
-                    token_iterator = stream_generate(
-                        model=model,
-                        processor=processor,
-                        prompt=formatted_prompt,
-                        image=images,
-                        audio=audio,
-                        **generation_kwargs,
-                    )
-
-                    output_text = ""
-                    request_id = f"chatcmpl-{uuid.uuid4()}"
-                    for chunk in token_iterator:
-                        if chunk is None or not hasattr(chunk, "text"):
-                            print("Warning: Received unexpected chunk format:", chunk)
-                            continue
-
-                        output_text += chunk.text
-
-                        # Yield chunks in Server-Sent Events (SSE) format
-                        usage_stats = {
-                            "input_tokens": chunk.prompt_tokens,
-                            "output_tokens": chunk.generation_tokens,
-                            "total_tokens": chunk.prompt_tokens
-                            + chunk.generation_tokens,
-                            "prompt_tps": chunk.prompt_tps,
-                            "generation_tps": chunk.generation_tps,
-                            "peak_memory": chunk.peak_memory,
-                        }
-
-                        choices = [
-                            ChatStreamChoice(
-                                delta=ChatMessage(role="assistant", content=chunk.text)
-                            )
-                        ]
-                        chunk_data = ChatStreamChunk(
-                            id=request_id,
-                            created=int(time.time()),
-                            model=request.model,
-                            usage=usage_stats,
-                            choices=choices,
-                        )
-
-                        yield f"data: {chunk_data.model_dump_json()}\n\n"
-
-                    if tool_parser_type is not None:
-                        tool_calls = process_tool_calls(
-                            model_output=output_text,
-                            tool_module=tool_module,
-                            tools=tools,
-                        )
-                    else:
-                        tool_calls = {}
-                        tool_calls["calls"] = []
-
-                    # Signal stream end
-                    choices = [
-                        ChatStreamChoice(
-                            finish_reason="stop",
-                            delta=ChatMessage(
-                                role="assistant",
-                                content="",
-                                tool_calls=tool_calls["calls"],
-                            ),
-                        )
-                    ]
-
-                    chunk_data = ChatStreamChunk(
-                        id=request_id,
-                        created=int(time.time()),
-                        model=request.model,
-                        usage=usage_stats,
-                        choices=choices,
-                    )
-                    yield f"data: {chunk_data.model_dump_json()}\n\n"
-
-                    yield "data: [DONE]\n\n"
-
-                except Exception as e:
-                    print(f"Error during stream generation: {e}")
-                    traceback.print_exc()
-                    error_data = json.dumps({"error": str(e)})
-                    yield f"data: {error_data}\n\n"
-
-                finally:
-                    mx.clear_cache()
-                    gc.collect()
-                    print("Stream finished, cleared cache.")
-
-            return StreamingResponse(
-                stream_generator(),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
-                },
-            )
+            return sse_response(_stream_chat(
+                model, processor, formatted_prompt, images, audio, generation_config,
+                model_name, tool_parser_type, tool_module, request.tools,
+            ))
 
         else:
             # Non-streaming response
@@ -1218,7 +1104,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                     image=images,
                     audio=audio,
                     verbose=False,  # Keep API output clean
-                    **generation_kwargs,
+                    **generation_config,
                 )
                 # Clean up resources
                 mx.clear_cache()
@@ -1238,7 +1124,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                     tool_calls = process_tool_calls(
                         model_output=gen_result.text,
                         tool_module=tool_module,
-                        tools=tools,
+                        tools=request.tools,
                     )
                 else:
                     tool_calls = {}
@@ -1257,7 +1143,9 @@ async def chat_completions_endpoint(request: ChatRequest):
                 ]
 
                 result = ChatResponse(
-                    model=request.model, usage=usage_stats, choices=choices
+                    model=model_name,
+                    usage=usage_stats,
+                    choices=choices,
                 )
 
                 return result
@@ -1350,12 +1238,12 @@ async def unload_model_endpoint():
     }
 
 
-def main():
+def build_parser():
     parser = argparse.ArgumentParser(description="MLX VLM Http Server.")
     parser.add_argument(
         "--model",
         type=str,
-        help="Optional path to the MLX model weights, tokenizer, and config",
+        help="Optional Hugging Face repo ID or local path to the MLX model weights, tokenizer, and config.",
     )
     parser.add_argument(
         "--adapter-path",
@@ -1380,9 +1268,41 @@ def main():
         help="Trust remote code when loading models from Hugging Face Hub.",
     )
     parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="Default maximum number of tokens to generate per request.",
+    )
+    parser.add_argument(
+        "--temperature",
+        "--temp",
+        dest="temperature",
+        type=float,
+        default=None,
+        help="Default sampling temperature per request.",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=None,
+        help="Default top-p sampling value per request.",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=None,
+        help="Default top-k sampling cutoff per request.",
+    )
+    parser.add_argument(
+        "--min-p",
+        type=float,
+        default=None,
+        help="Default min-p sampling threshold per request.",
+    )
+    parser.add_argument(
         "--prefill-step-size",
         type=int,
-        default=DEFAULT_PREFILL_STEP_SIZE,
+        default=None,
         help="Number of tokens to process per prefill step. "
         "Lower values reduce peak memory usage but may be slower. "
         "Try 512 or 256 if you hit GPU memory errors during prefill.",
@@ -1390,43 +1310,41 @@ def main():
     parser.add_argument(
         "--kv-bits",
         type=int,
-        default=0,
+        default=None,
         help="Number of bits for KV cache quantization.",
     )
     parser.add_argument(
         "--kv-group-size",
         type=int,
-        default=DEFAULT_KV_GROUP_SIZE,
+        default=None,
         help="Group size for KV cache quantization.",
     )
     parser.add_argument(
         "--max-kv-size",
         type=int,
-        default=0,
+        default=None,
         help="Maximum KV size for the prompt cache (tokens).",
     )
     parser.add_argument(
         "--quantized-kv-start",
         type=int,
-        default=DEFAULT_QUANTIZED_KV_START,
+        default=None,
         help="Start index (of token) for the quantized KV cache.",
     )
-    args = parser.parse_args()
-    if args.trust_remote_code:
-        os.environ["MLX_TRUST_REMOTE_CODE"] = "true"
-    if args.model:
-        os.environ["PRELOAD_MODEL"] = args.model
-    if args.adapter_path:
-        os.environ["PRELOAD_ADAPTER"] = args.adapter_path
-    os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
-    os.environ["KV_BITS"] = str(args.kv_bits)
-    os.environ["KV_GROUP_SIZE"] = str(args.kv_group_size)
-    os.environ["MAX_KV_SIZE"] = str(args.max_kv_size)
-    os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
+    return parser
 
-    uvicorn.run(
-        "mlx_vlm.server:app", host=args.host, port=args.port, workers=1, reload=True
-    )  # reload=True for development to automatically restart on code changes.
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    env_trust_remote_code = os.environ.get("MLX_TRUST_REMOTE_CODE", "false").lower() == "true"
+    app.state.server_config = {
+        "model": args.model,
+        "adapter_path": args.adapter_path,
+        "trust_remote_code": args.trust_remote_code or env_trust_remote_code,
+        "generation": filter_generation_config(vars(args)),
+    }
+    uvicorn.run(app, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
