@@ -8,7 +8,7 @@ from typing import Callable, Optional, Union
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_map_with_path
-from mlx_lm.utils import QUANT_MODE_DEFAULTS, dequantize_model, quantize_model
+from mlx_lm.utils import dequantize_model, quantize_model
 
 from .utils import (
     MODEL_CONVERSION_DTYPES,
@@ -20,6 +20,13 @@ from .utils import (
     skip_multimodal_module,
     upload_to_hub,
 )
+
+QUANT_MODE_DEFAULTS = {
+    "affine": (64, 4),
+    "mxfp4": (32, 4),
+    "nvfp4": (16, 4),
+    "mxfp8": (32, 8),
+}
 
 QUANT_RECIPES = [
     "mixed_2_6",
@@ -143,9 +150,7 @@ def warn_mode_override_conflicts(
         )
 
 
-def warn_mixed_mode_overrides(
-    q_mode: str, overrides: list[ParsedOverride]
-) -> None:
+def warn_mixed_mode_overrides(q_mode: str, overrides: list[ParsedOverride]) -> None:
     if q_mode == "affine":
         return
     if not any(isinstance(value, int) for _, value in overrides):
@@ -161,9 +166,7 @@ def parse_overrides(overrides: list[str]) -> list[ParsedOverride]:
     parsed = []
     for entry in overrides:
         if "=" not in entry:
-            raise ValueError(
-                f"Invalid override '{entry}'. Expected PATTERN=VALUE"
-            )
+            raise ValueError(f"Invalid override '{entry}'. Expected PATTERN=VALUE")
         pattern, value = entry.split("=", 1)
         try:
             compiled = re.compile(pattern)
