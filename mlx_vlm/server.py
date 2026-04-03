@@ -1,6 +1,5 @@
 import argparse
 import gc
-import importlib
 import json
 import os
 import re
@@ -17,24 +16,27 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from huggingface_hub import scan_cache_dir
-from mlx_lm.tokenizer_utils import _infer_tool_parser
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing_extensions import Required, TypeAlias, TypedDict
 
 from .generate import (
     DEFAULT_KV_GROUP_SIZE,
+    DEFAULT_KV_QUANT_SCHEME,
     DEFAULT_MAX_TOKENS,
     DEFAULT_MODEL_PATH,
     DEFAULT_PREFILL_STEP_SIZE,
     DEFAULT_QUANTIZED_KV_START,
     DEFAULT_SEED,
     DEFAULT_TEMPERATURE,
+    DEFAULT_THINKING_END_TOKEN,
+    DEFAULT_THINKING_START_TOKEN,
     DEFAULT_TOP_P,
     generate,
     normalize_resize_shape,
     stream_generate,
 )
 from .prompt_utils import apply_chat_template
+from .tool_parsers import _infer_tool_parser, load_tool_module
 from .utils import load
 from .version import __version__
 
@@ -47,7 +49,7 @@ def get_prefill_step_size():
 
 
 def get_quantized_kv_bits(model: str):
-    kv_bits = int(os.environ.get("KV_BITS", 0))
+    kv_bits = float(os.environ.get("KV_BITS", 0))
     if kv_bits == 0:
         return None
     if "qat" in model:
@@ -60,6 +62,10 @@ def get_quantized_kv_bits(model: str):
 
 def get_kv_group_size():
     return int(os.environ.get("KV_GROUP_SIZE", DEFAULT_KV_GROUP_SIZE))
+
+
+def get_kv_quant_scheme():
+    return os.environ.get("KV_QUANT_SCHEME", DEFAULT_KV_QUANT_SCHEME)
 
 
 def get_max_kv_size(model: str):
@@ -336,21 +342,23 @@ class TemplateParams(FlexibleBaseModel):
         description="Maximum number of thinking tokens before forcing the end token.",
     )
     thinking_start_token: Optional[str] = Field(
-        None,
+        DEFAULT_THINKING_START_TOKEN,
         description="Token that marks the start of a thinking block.",
     )
     thinking_end_token: Optional[str] = Field(
-        None,
+        DEFAULT_THINKING_END_TOKEN,
         description="Token that marks the end of a thinking block.",
     )
 
     def template_kwargs(self) -> dict[str, Any]:
-        return self.dump_kwargs(
+        kwargs = self.dump_kwargs(
             "enable_thinking",
             "thinking_budget",
             "thinking_start_token",
             "thinking_end_token",
         )
+        kwargs.setdefault("enable_thinking", False)
+        return kwargs
 
 
 class OpenAIRequest(GenerationParams, TemplateParams):
@@ -626,6 +634,7 @@ def build_generation_kwargs(
         "prefill_step_size": get_prefill_step_size(),
         "kv_bits": get_quantized_kv_bits(request.model),
         "kv_group_size": get_kv_group_size(),
+        "kv_quant_scheme": get_kv_quant_scheme(),
         "max_kv_size": get_max_kv_size(request.model),
         "quantized_kv_start": get_quantized_kv_start(),
         **request.generation_kwargs(),
@@ -1088,9 +1097,7 @@ async def chat_completions_endpoint(request: ChatRequest):
         if hasattr(tokenizer, "chat_template"):
             tool_parser_type = _infer_tool_parser(tokenizer.chat_template)
             if tool_parser_type is not None:
-                tool_module = importlib.import_module(
-                    f"mlx_lm.tool_parsers.{tool_parser_type}"
-                )
+                tool_module = load_tool_module(tool_parser_type)
         template_kwargs = request.template_kwargs()
         formatted_prompt = apply_chat_template(
             processor,
@@ -1389,15 +1396,23 @@ def main():
     )
     parser.add_argument(
         "--kv-bits",
-        type=int,
+        type=float,
         default=0,
         help="Number of bits for KV cache quantization.",
+    )
+    parser.add_argument(
+        "--kv-quant-scheme",
+        type=str,
+        choices=("uniform", "turboquant"),
+        default=DEFAULT_KV_QUANT_SCHEME,
+        help="KV cache quantization backend. Fractional --kv-bits values use "
+        "TurboQuant automatically.",
     )
     parser.add_argument(
         "--kv-group-size",
         type=int,
         default=DEFAULT_KV_GROUP_SIZE,
-        help="Group size for KV cache quantization.",
+        help="Group size for uniform KV cache quantization.",
     )
     parser.add_argument(
         "--max-kv-size",
@@ -1411,6 +1426,14 @@ def main():
         default=DEFAULT_QUANTIZED_KV_START,
         help="Start index (of token) for the quantized KV cache.",
     )
+    parser.add_argument(
+        "--reload",
+        action="store_true",
+        default=False,
+        help="Enable auto-reload on file changes (development only). "
+        "WARNING: watches the entire working directory — can cause excessive memory "
+        "usage with large models in repos with frequent file changes.",
+    )
     args = parser.parse_args()
     if args.trust_remote_code:
         os.environ["MLX_TRUST_REMOTE_CODE"] = "true"
@@ -1421,12 +1444,17 @@ def main():
     os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
     os.environ["KV_BITS"] = str(args.kv_bits)
     os.environ["KV_GROUP_SIZE"] = str(args.kv_group_size)
+    os.environ["KV_QUANT_SCHEME"] = args.kv_quant_scheme
     os.environ["MAX_KV_SIZE"] = str(args.max_kv_size)
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
 
     uvicorn.run(
-        "mlx_vlm.server:app", host=args.host, port=args.port, workers=1, reload=True
-    )  # reload=True for development to automatically restart on code changes.
+        "mlx_vlm.server:app",
+        host=args.host,
+        port=args.port,
+        workers=1,
+        reload=args.reload,
+    )
 
 
 if __name__ == "__main__":
