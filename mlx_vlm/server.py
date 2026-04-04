@@ -1,6 +1,5 @@
 import argparse
 import gc
-import importlib
 import json
 import os
 import re
@@ -17,25 +16,69 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from huggingface_hub import scan_cache_dir
-from mlx_lm.tokenizer_utils import _infer_tool_parser
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing_extensions import Required, TypeAlias, TypedDict
 
 from .generate import (
     DEFAULT_SEED,
     filter_generation_config,
     generate,
-    resolve_generation_config,
+    normalize_resize_shape,
+    resolve_generation_config as resolve_generation_args,
     stream_generate,
 )
 from .prompt_utils import apply_chat_template, filter_chat_template_kwargs
+from .tool_parsers import _infer_tool_parser, load_tool_module
 from .utils import load
 from .version import __version__
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
+SERVER_CONFIG_ENV = "MLX_VLM_SERVER_CONFIG"
 ResizeShapeInput: TypeAlias = tuple[int] | tuple[int, int]
 
+
+def empty_server_config() -> dict[str, Any]:
+    return {
+        "model": None,
+        "adapter_path": None,
+        "trust_remote_code": False,
+        "generation": {},
+    }
+
+
+def build_server_config(args: argparse.Namespace) -> dict[str, Any]:
+    env_trust_remote_code = (
+        os.environ.get("MLX_TRUST_REMOTE_CODE", "false").lower() == "true"
+    )
+    return {
+        "model": args.model,
+        "adapter_path": args.adapter_path,
+        "trust_remote_code": args.trust_remote_code or env_trust_remote_code,
+        "generation": filter_generation_config(vars(args)),
+    }
+
+
+def load_server_config_from_env() -> dict[str, Any]:
+    raw = os.environ.get(SERVER_CONFIG_ENV)
+    if not raw:
+        return empty_server_config()
+    try:
+        config = json.loads(raw)
+    except json.JSONDecodeError:
+        return empty_server_config()
+    return {
+        **empty_server_config(),
+        **config,
+        "generation": filter_generation_config(config.get("generation", {})),
+    }
+
+
+def resolve_generation_config(
+    generation: dict[str, Any],
+    model_name: Optional[str] = None,
+) -> dict[str, Any]:
+    return resolve_generation_args(generation, model_name=model_name)
 
 
 def resolve_load_config(
@@ -59,10 +102,15 @@ def resolve_load_config(
     return model_name, adapter_path
 
 
-
-def get_model(model_path: str, adapter_path: Optional[str] = None):
+def get_cached_model(
+    model_path: str,
+    adapter_path: Optional[str] = None,
+    *,
+    trust_remote_code: Optional[bool] = None,
+):
     global model_cache
-    trust_remote_code = app.state.server_config["trust_remote_code"]
+    if trust_remote_code is None:
+        trust_remote_code = app.state.server_config["trust_remote_code"]
     cache_key = (model_path, adapter_path, trust_remote_code)
 
     if model_cache.get("cache_key") == cache_key:
@@ -72,8 +120,15 @@ def get_model(model_path: str, adapter_path: Optional[str] = None):
         unload_model_sync()
 
     try:
-        print(f"Loading model: {model_path}" + (f", adapter: {adapter_path}" if adapter_path else ""))
-        model, processor = load(model_path, adapter_path, trust_remote_code=trust_remote_code)
+        print(
+            f"Loading model: {model_path}"
+            + (f", adapter: {adapter_path}" if adapter_path else "")
+        )
+        model, processor = load(
+            model_path,
+            adapter_path,
+            trust_remote_code=trust_remote_code,
+        )
         config = model.config
     except Exception as e:
         traceback.print_exc()
@@ -99,7 +154,11 @@ async def lifespan(server_app):
     if model_path:
         try:
             print(f"Preloading model: {model_path}")
-            get_model(model_path, adapter_path)
+            get_cached_model(
+                model_path,
+                adapter_path,
+                trust_remote_code=server_config["trust_remote_code"],
+            )
         except Exception as e:
             print(f"Failed to preload model: {e}")
             print("Server will continue without a preloaded model.")
@@ -113,7 +172,7 @@ app = FastAPI(
     version=__version__,
     lifespan=lifespan,
 )
-app.state.server_config = {"model": None, "adapter_path": None, "trust_remote_code": False, "generation": {}}
+app.state.server_config = load_server_config_from_env()
 
 app.add_middleware(
     CORSMiddleware,
@@ -134,6 +193,9 @@ class FlexibleBaseModel(BaseModel):
     """Base model that ignores unknown OpenAI SDK fields."""
 
     model_config = ConfigDict(extra="ignore")
+
+    def dump_kwargs(self, *fields: str) -> dict[str, Any]:
+        return self.model_dump(include=set(fields), exclude_none=True)
 
 
 class CommonRequest(FlexibleBaseModel):
@@ -177,13 +239,17 @@ class CommonRequest(FlexibleBaseModel):
         None,
         description="Number of tokens to process per prefill step.",
     )
-    kv_bits: Optional[int] = Field(
+    kv_bits: Optional[float] = Field(
         None,
         description="Number of bits for KV cache quantization.",
     )
     kv_group_size: Optional[int] = Field(
         None,
         description="Group size for KV cache quantization.",
+    )
+    kv_quant_scheme: Optional[str] = Field(
+        None,
+        description="KV cache quantization backend.",
     )
     max_kv_size: Optional[int] = Field(
         None,
@@ -209,6 +275,11 @@ class CommonRequest(FlexibleBaseModel):
         None,
         description="Token that marks the end of a thinking block.",
     )
+
+    @field_validator("resize_shape", mode="before")
+    @classmethod
+    def normalize_resize_shape_field(cls, value):
+        return normalize_resize_shape(value)
 
 
 
@@ -929,19 +1000,19 @@ async def responses_endpoint(openai_request: OpenAIRequest):
             request_gen["max_tokens"] = openai_request.max_output_tokens
         merged = {**server_config["generation"], **request_gen}
         try:
-            generation_config = resolve_generation_config(merged)
+            generation_config = resolve_generation_config(merged, model_name)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        if "qat" in model_name and "kv_bits" in generation_config:
-            print(f"Model {model_name} is QAT; kv_bits ignored. Use --max-kv-size instead.")
-            generation_config.pop("kv_bits")
-            generation_config.pop("max_kv_size", None)
         template_kwargs = filter_chat_template_kwargs({**merged, **raw})
 
         if len(images) > MAX_IMAGES:
             raise HTTPException(status_code=400, detail=f"Too many images. Maximum supported is {MAX_IMAGES}.")
 
-        model, processor, config = get_model(model_name, adapter_path)
+        model, processor, config = get_cached_model(
+            model_name,
+            adapter_path,
+            trust_remote_code=server_config["trust_remote_code"],
+        )
         try:
             formatted_prompt = apply_chat_template(
                 processor, config, chat_messages,
@@ -1053,19 +1124,19 @@ async def chat_completions_endpoint(
         request_gen = filter_generation_config(raw)
         merged = {**server_config["generation"], **request_gen}
         try:
-            generation_config = resolve_generation_config(merged)
+            generation_config = resolve_generation_config(merged, model_name)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        if "qat" in model_name and "kv_bits" in generation_config:
-            print(f"Model {model_name} is QAT; kv_bits ignored. Use --max-kv-size instead.")
-            generation_config.pop("kv_bits")
-            generation_config.pop("max_kv_size", None)
         template_kwargs = filter_chat_template_kwargs({**merged, **raw})
 
         if len(images) > MAX_IMAGES:
             raise HTTPException(status_code=400, detail=f"Too many images. Maximum supported is {MAX_IMAGES}.")
 
-        model, processor, config = get_model(model_name, adapter_path)
+        model, processor, config = get_cached_model(
+            model_name,
+            adapter_path,
+            trust_remote_code=server_config["trust_remote_code"],
+        )
         try:
             formatted_prompt = apply_chat_template(
                 processor, config, processed_messages,
@@ -1083,9 +1154,7 @@ async def chat_completions_endpoint(
         if hasattr(tokenizer, "chat_template"):
             tool_parser_type = _infer_tool_parser(tokenizer.chat_template)
             if tool_parser_type is not None:
-                tool_module = importlib.import_module(
-                    f"mlx_lm.tool_parsers.{tool_parser_type}"
-                )
+                tool_module = load_tool_module(tool_parser_type)
 
         if request.stream:
             return sse_response(_stream_chat(
@@ -1309,9 +1378,17 @@ def build_parser():
     )
     parser.add_argument(
         "--kv-bits",
-        type=int,
+        type=float,
         default=None,
         help="Number of bits for KV cache quantization.",
+    )
+    parser.add_argument(
+        "--kv-quant-scheme",
+        type=str,
+        choices=("uniform", "turboquant"),
+        default=None,
+        help="KV cache quantization backend. Fractional --kv-bits values use "
+        "TurboQuant automatically.",
     )
     parser.add_argument(
         "--kv-group-size",
@@ -1331,19 +1408,35 @@ def build_parser():
         default=None,
         help="Start index (of token) for the quantized KV cache.",
     )
+    parser.add_argument(
+        "--reload",
+        action="store_true",
+        default=False,
+        help="Enable auto-reload on file changes (development only). "
+        "WARNING: watches the entire working directory. This can be expensive "
+        "when large models and active file watchers share the same repo.",
+    )
     return parser
 
 
 def main():
     parser = build_parser()
     args = parser.parse_args()
-    env_trust_remote_code = os.environ.get("MLX_TRUST_REMOTE_CODE", "false").lower() == "true"
-    app.state.server_config = {
-        "model": args.model,
-        "adapter_path": args.adapter_path,
-        "trust_remote_code": args.trust_remote_code or env_trust_remote_code,
-        "generation": filter_generation_config(vars(args)),
-    }
+    server_config = build_server_config(args)
+    app.state.server_config = server_config
+
+    if args.reload:
+        os.environ[SERVER_CONFIG_ENV] = json.dumps(server_config)
+        uvicorn.run(
+            "mlx_vlm.server:app",
+            host=args.host,
+            port=args.port,
+            workers=1,
+            reload=True,
+        )
+        return
+
+    os.environ.pop(SERVER_CONFIG_ENV, None)
     uvicorn.run(app, host=args.host, port=args.port)
 
 

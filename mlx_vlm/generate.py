@@ -11,13 +11,14 @@ from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_reduce
-from mlx_lm.generate import maybe_quantize_kv_cache
+from mlx_lm.generate import maybe_quantize_kv_cache as mlx_maybe_quantize_kv_cache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer
 
 from .models import cache
 from .prompt_utils import apply_chat_template
+from .turboquant import TurboQuantKVCache, turboquant_enabled
 from .utils import (
     StoppingCriteria,
     ThinkingBudgetCriteria,
@@ -38,8 +39,10 @@ DEFAULT_TOP_K = 0
 DEFAULT_MIN_P = 0.0
 DEFAULT_REPETITION_CONTEXT_SIZE = 20
 DEFAULT_KV_GROUP_SIZE = 64
+DEFAULT_KV_QUANT_SCHEME = "uniform"
 DEFAULT_COMPLETION_BATCH_SIZE = 32
 DEFAULT_PREFILL_BATCH_SIZE = 8
+DEFAULT_THINKING_START_TOKEN = "<think>"
 DEFAULT_THINKING_END_TOKEN = "</think>"
 DEFAULT_QUANTIZED_KV_START = 5000
 DEFAULT_PREFILL_STEP_SIZE = 2048
@@ -56,6 +59,7 @@ GENERATION_KWARG_KEYS = frozenset(
         "prefill_step_size",
         "kv_bits",
         "kv_group_size",
+        "kv_quant_scheme",
         "max_kv_size",
         "quantized_kv_start",
         "enable_thinking",
@@ -75,7 +79,10 @@ def filter_generation_config(values: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def resolve_generation_config(generation: Dict[str, Any]) -> Dict[str, Any]:
+def resolve_generation_config(
+    generation: Dict[str, Any],
+    model_name: Optional[str] = None,
+) -> Dict[str, Any]:
     normalized = {
         "max_tokens": DEFAULT_MAX_TOKENS,
         "temperature": DEFAULT_TEMPERATURE,
@@ -84,11 +91,17 @@ def resolve_generation_config(generation: Dict[str, Any]) -> Dict[str, Any]:
         "min_p": DEFAULT_MIN_P,
         "prefill_step_size": DEFAULT_PREFILL_STEP_SIZE,
         "kv_group_size": DEFAULT_KV_GROUP_SIZE,
+        "kv_quant_scheme": DEFAULT_KV_QUANT_SCHEME,
         "quantized_kv_start": DEFAULT_QUANTIZED_KV_START,
         **filter_generation_config(generation),
     }
     if "resize_shape" in normalized:
         normalized["resize_shape"] = normalize_resize_shape(normalized["resize_shape"])
+    if model_name and "qat" in model_name and "kv_bits" in normalized:
+        print(
+            f"Model {model_name} is QAT; kv_bits ignored. Use --max-kv-size instead."
+        )
+        normalized.pop("kv_bits")
     kv_bits = normalized.get("kv_bits")
     if normalized.get("max_kv_size") is not None and kv_bits is not None:
         print("QuantizedKVCache is active; max_kv_size is ignored. Use --kv-bits instead.")
@@ -175,15 +188,23 @@ def parse_arguments():
     )
     parser.add_argument(
         "--kv-bits",
-        type=int,
+        type=float,
         default=None,
         help="Number of bits to quantize the KV cache to.",
+    )
+    parser.add_argument(
+        "--kv-quant-scheme",
+        type=str,
+        choices=("uniform", "turboquant"),
+        default=DEFAULT_KV_QUANT_SCHEME,
+        help="KV cache quantization backend. Fractional --kv-bits values use "
+        "TurboQuant automatically.",
     )
     parser.add_argument(
         "--kv-group-size",
         type=int,
         default=DEFAULT_KV_GROUP_SIZE,
-        help="Group size for the KV cache.",
+        help="Group size for uniform KV cache quantization.",
     )
     parser.add_argument(
         "--quantized-kv-start",
@@ -248,9 +269,8 @@ def parse_arguments():
     parser.add_argument(
         "--thinking-start-token",
         type=str,
-        default=None,
-        help="Token that marks the start of a thinking block (e.g. '<think>'). "
-        "If not set, thinking is assumed to start immediately.",
+        default=DEFAULT_THINKING_START_TOKEN,
+        help="Token that marks the start of a thinking block (default: %(default)s).",
     )
     parser.add_argument(
         "--thinking-end-token",
@@ -279,6 +299,52 @@ def normalize_resize_shape(
 
 # A stream on the default device just for generation
 generation_stream = mx.new_stream(mx.default_device())
+
+
+def maybe_quantize_kv_cache(
+    prompt_cache,
+    quantized_kv_start,
+    kv_group_size,
+    kv_bits,
+    kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
+):
+    if kv_bits is None:
+        return
+
+    if turboquant_enabled(kv_bits, kv_quant_scheme):
+
+        def quantize_entry(entry):
+            if isinstance(entry, TurboQuantKVCache):
+                return entry
+            # Convert standard KV caches with (B, H, T, D) state format.
+            # Skip RotatingKVCache — its sliding window is already compact
+            # and TurboQuant's overhead outweighs savings for short windows.
+            if isinstance(entry, cache.KVCache):
+                if entry.offset == 0:
+                    # Empty: replace so update_and_fetch quantizes on the fly
+                    return TurboQuantKVCache(bits=kv_bits)
+                if entry.offset < quantized_kv_start:
+                    return entry
+                return TurboQuantKVCache.from_cache(entry, bits=kv_bits)
+            if isinstance(entry, cache.CacheList):
+                entry.caches = [quantize_entry(sub_entry) for sub_entry in entry.caches]
+                return entry
+            if isinstance(entry, list):
+                return [quantize_entry(sub_entry) for sub_entry in entry]
+            if isinstance(entry, tuple):
+                return tuple(quantize_entry(sub_entry) for sub_entry in entry)
+            return entry
+
+        for index, layer_cache in enumerate(prompt_cache):
+            prompt_cache[index] = quantize_entry(layer_cache)
+        return
+
+    mlx_maybe_quantize_kv_cache(
+        prompt_cache,
+        quantized_kv_start=quantized_kv_start,
+        kv_group_size=kv_group_size,
+        kv_bits=int(kv_bits),
+    )
 
 
 @contextlib.contextmanager
@@ -348,8 +414,9 @@ def generate_step(
     logit_bias: Optional[Dict[int, float]] = None,
     prompt_cache: Optional[List[Any]] = None,
     max_kv_size: Optional[int] = None,
-    kv_bits: Optional[int] = None,
+    kv_bits: Optional[float] = None,
     kv_group_size: int = DEFAULT_KV_GROUP_SIZE,
+    kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
     quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
     sampler: Optional[Callable[[mx.array], mx.array]] = None,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
@@ -378,8 +445,9 @@ def generate_step(
         logit_bias (dictionary, optional): Additive logit bias.
         prompt_cache (list, optional): Pre-existing KV cache for the prompt.
         max_kv_size (int, optional): Maximum KV cache size.
-        kv_bits (int, optional): Number of bits for KV cache quantization.
-        kv_group_size (int): Group size for KV cache quantization.
+        kv_bits (float, optional): Number of bits for KV cache quantization.
+        kv_group_size (int): Group size for uniform KV cache quantization.
+        kv_quant_scheme (str): KV cache quantization backend.
         quantized_kv_start (int): Start index for quantized KV cache.
         sampler (Callable[mx.array, mx.array], optional): A sampler for sampling a
           token from a vector of log probabilities.
@@ -400,6 +468,7 @@ def generate_step(
         quantized_kv_start=quantized_kv_start,
         kv_group_size=kv_group_size,
         kv_bits=kv_bits,
+        kv_quant_scheme=kv_quant_scheme,
     )
 
     if sampler is None:
@@ -482,6 +551,8 @@ def generate_step(
                 if k != "inputs_embeds" and v is not None
             }
         )
+        if getattr(model, "no_chunked_prefill", False):
+            prefill_step_size = None
         if prefill_step_size is not None and inputs_embeds.shape[1] > prefill_step_size:
             # Chunked prefill with embeddings
             total_tokens = inputs_embeds.shape[1]
@@ -560,7 +631,9 @@ def stream_generate(
     # Set up thinking budget criteria if requested
     thinking_budget = kwargs.pop("thinking_budget", None)
     thinking_end_token = kwargs.pop("thinking_end_token", DEFAULT_THINKING_END_TOKEN)
-    thinking_start_token = kwargs.pop("thinking_start_token", None)
+    thinking_start_token = kwargs.pop(
+        "thinking_start_token", DEFAULT_THINKING_START_TOKEN
+    )
     enable_thinking = kwargs.pop("enable_thinking", False)
 
     # Skip special tokens
@@ -573,7 +646,7 @@ def stream_generate(
 
     add_special_tokens = (
         not hasattr(processor, "chat_template")
-        if model.config.model_type in ["gemma3", "gemma3n"]
+        if model.config.model_type in ["gemma3", "gemma3n", "gemma4"]
         else True
     )
 
@@ -1339,7 +1412,7 @@ def _generate_batch(
 
     add_special_tokens = (
         not hasattr(processor, "chat_template")
-        if model.config.model_type in ["gemma3", "gemma3n"]
+        if model.config.model_type in ["gemma3", "gemma3n", "gemma4"]
         else True
     )
 
@@ -1365,6 +1438,10 @@ def _generate_batch(
         for k, v in inputs.items()
         if k not in ["input_ids", "pixel_values", "attention_mask"]
     }
+
+    if getattr(model, "no_chunked_prefill", False):
+        kwargs.pop("prefill_step_size", None)
+        kwargs["prefill_step_size"] = None
 
     # Use batch_size for prefill and completion to ensure consistent processing
     gen = BatchGenerator(
@@ -1420,9 +1497,8 @@ def main():
     num_audios = (
         1 if args.audio is not None else 0
     )  # TODO: Support multiple audio files
-    chat_template_kwargs = {}
-    if args.enable_thinking:
-        chat_template_kwargs["enable_thinking"] = True
+
+    chat_template_kwargs = {"enable_thinking": args.enable_thinking}
 
     prompt = apply_chat_template(
         processor,
@@ -1453,8 +1529,7 @@ def main():
         kwargs.update(args.processor_kwargs)
 
     # Add thinking kwargs
-    if args.enable_thinking:
-        kwargs["enable_thinking"] = True
+    kwargs["enable_thinking"] = args.enable_thinking
     if args.thinking_budget is not None:
         kwargs["thinking_budget"] = args.thinking_budget
         kwargs["thinking_end_token"] = args.thinking_end_token

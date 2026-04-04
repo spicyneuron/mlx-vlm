@@ -53,6 +53,7 @@ MODEL_CONFIG = {
     "kimi_vl": MessageFormat.LIST_WITH_IMAGE,
     "gemma3": MessageFormat.START_IMAGE_TOKEN,
     "gemma3n": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
+    "gemma4": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
     "llama4": MessageFormat.LIST_WITH_IMAGE,
     "smolvlm": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "llava": MessageFormat.LIST_WITH_IMAGE,
@@ -77,6 +78,7 @@ MODEL_CONFIG = {
     "florence2": MessageFormat.PROMPT_ONLY,
     "molmo": MessageFormat.PROMPT_ONLY,
     "moondream3": MessageFormat.PROMPT_ONLY,
+    "falcon_ocr": MessageFormat.PROMPT_ONLY,
     "paligemma": MessageFormat.PROMPT_WITH_IMAGE_TOKEN,
 }
 
@@ -88,6 +90,7 @@ SINGLE_IMAGE_ONLY_MODELS = {
     "paligemma",
     "multi_modality",
     "mllama",
+    "falcon_ocr",
 }
 CHAT_TEMPLATE_KWARG_KEYS = frozenset(
     {
@@ -742,7 +745,7 @@ def apply_chat_template(
         return messages
 
     # Some models only need the last message
-    if model_type in ["paligemma", "molmo", "florence2"]:
+    if model_type in ["paligemma", "molmo", "florence2", "falcon_ocr"]:
         return messages[-1]
 
     return get_chat_template(processor, messages, add_generation_prompt, **kwargs)
