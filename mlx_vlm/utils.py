@@ -33,6 +33,33 @@ WEIGHT_KEY_ALIASES = (
     ("lm_head.", "language_model.lm_head."),
 )
 
+FUSED_QKV_SUFFIXES = (
+    ("in_proj_weight", ("q_proj.weight", "k_proj.weight", "v_proj.weight")),
+    ("in_proj.weight", ("q_proj.weight", "k_proj.weight", "v_proj.weight")),
+    ("in_proj_bias", ("q_proj.bias", "k_proj.bias", "v_proj.bias")),
+    ("in_proj.bias", ("q_proj.bias", "k_proj.bias", "v_proj.bias")),
+)
+
+FUSED_GATE_UP_SUFFIXES = (
+    (
+        ".experts.gate_up_proj",
+        ".experts.switch_glu.gate_proj.weight",
+        ".experts.switch_glu.up_proj.weight",
+    ),
+    (
+        ".experts.gate_up_proj",
+        ".switch_mlp.gate_proj.weight",
+        ".switch_mlp.up_proj.weight",
+    ),
+    (".gate_up_proj", ".gate_proj.weight", ".up_proj.weight"),
+)
+
+DOWN_PROJ_SUFFIXES = (
+    (".experts.down_proj", ".experts.switch_glu.down_proj.weight"),
+    (".experts.down_proj", ".switch_mlp.down_proj.weight"),
+    (".down_proj", ".down_proj.weight"),
+)
+
 # Constants
 MODEL_REMAPPING = {
     "llava_qwen2": "fastvlm",  # Apple's FastVLM, note it's different to the one below
@@ -268,6 +295,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                     model_class.AudioModel, weights, model_config.audio_config
                 )
         weights = canonicalize_weight_keys(weights, expected_keys)
+        weights = adapt_weight_structure(weights, expected_keys)
 
     if not "quantization" in config:
         quantization_config = config.get("quantization_config", None)
@@ -376,6 +404,112 @@ def canonicalize_weight_keys(weights, expected_keys):
         logging.info("Canonicalized %d checkpoint weight key(s)", renamed)
 
     return canonicalized
+
+
+def adapt_weight_structure(weights, expected_keys):
+    """Apply common structural weight rewrites inferred from expected parameter names."""
+    weights, qkv_splits = split_fused_qkv_weights(weights, expected_keys)
+    weights, gate_up_splits = split_fused_gate_up_weights(weights, expected_keys)
+    weights, down_proj_renames = rename_down_proj_weights(weights, expected_keys)
+
+    if qkv_splits or gate_up_splits or down_proj_renames:
+        logging.info(
+            "Adapted checkpoint structure: %d qkv split(s), %d gate/up split(s), %d down_proj rename(s)",
+            qkv_splits,
+            gate_up_splits,
+            down_proj_renames,
+        )
+
+    return weights
+
+
+def split_fused_qkv_weights(weights, expected_keys):
+    split_weights = dict(weights)
+    splits = 0
+
+    for key in list(weights):
+        value = split_weights.get(key)
+        if value is None:
+            continue
+
+        for source_suffix, target_suffixes in FUSED_QKV_SUFFIXES:
+            if not key.endswith(source_suffix):
+                continue
+
+            target_keys = [
+                key[: -len(source_suffix)] + target_suffix
+                for target_suffix in target_suffixes
+            ]
+            if any(target_key not in expected_keys for target_key in target_keys):
+                continue
+            if any(target_key in split_weights for target_key in target_keys):
+                continue
+            if not value.shape or value.shape[0] % 3 != 0:
+                continue
+
+            chunks = mx.split(value, 3, axis=0)
+            split_weights.pop(key)
+            for target_key, chunk in zip(target_keys, chunks):
+                split_weights[target_key] = chunk
+            splits += 1
+            break
+
+    return split_weights, splits
+
+
+def split_fused_gate_up_weights(weights, expected_keys):
+    split_weights = dict(weights)
+    splits = 0
+
+    for key in list(weights):
+        value = split_weights.get(key)
+        if value is None or value.ndim < 2:
+            continue
+
+        for source_suffix, gate_suffix, up_suffix in FUSED_GATE_UP_SUFFIXES:
+            if not key.endswith(source_suffix):
+                continue
+
+            gate_key = key[: -len(source_suffix)] + gate_suffix
+            up_key = key[: -len(source_suffix)] + up_suffix
+            if gate_key not in expected_keys or up_key not in expected_keys:
+                continue
+            if gate_key in split_weights or up_key in split_weights:
+                continue
+            if value.shape[-2] % 2 != 0:
+                continue
+
+            gate_value, up_value = mx.split(value, 2, axis=-2)
+            split_weights.pop(key)
+            split_weights[gate_key] = gate_value
+            split_weights[up_key] = up_value
+            splits += 1
+            break
+
+    return split_weights, splits
+
+
+def rename_down_proj_weights(weights, expected_keys):
+    renamed_weights = dict(weights)
+    renames = 0
+
+    for key in list(weights):
+        if key not in renamed_weights:
+            continue
+
+        for source_suffix, target_suffix in DOWN_PROJ_SUFFIXES:
+            if not key.endswith(source_suffix):
+                continue
+
+            target_key = key[: -len(source_suffix)] + target_suffix
+            if target_key not in expected_keys or target_key in renamed_weights:
+                continue
+
+            renamed_weights[target_key] = renamed_weights.pop(key)
+            renames += 1
+            break
+
+    return renamed_weights, renames
 
 
 def update_module_configs(model_config, model_class, config, modules):
