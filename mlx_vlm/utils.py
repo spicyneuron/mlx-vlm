@@ -25,6 +25,14 @@ from .trainer.utils import apply_lora_layers
 # Modes that support activation quantization
 ACTIVATION_QUANTIZATION_MODES = {"nvfp4", "mxfp8"}
 
+WEIGHT_KEY_ALIASES = (
+    ("model.language_model.visual.", "vision_tower."),
+    ("language_model.model.visual.", "vision_tower."),
+    ("model.visual.", "vision_tower."),
+    ("model.language_model.", "language_model.model."),
+    ("lm_head.", "language_model.lm_head."),
+)
+
 # Constants
 MODEL_REMAPPING = {
     "llava_qwen2": "fastvlm",  # Apple's FastVLM, note it's different to the one below
@@ -235,6 +243,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     model_config = update_module_configs(model_config, model_class, config, modules)
 
     model = model_class.Model(model_config)
+    expected_keys = set(dict(tree_flatten(model.parameters())).keys())
 
     if not is_mlx_format:
         # Sanitize weights
@@ -258,6 +267,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 weights = sanitize_weights(
                     model_class.AudioModel, weights, model_config.audio_config
                 )
+        weights = canonicalize_weight_keys(weights, expected_keys)
 
     if not "quantization" in config:
         quantization_config = config.get("quantization_config", None)
@@ -336,6 +346,36 @@ def sanitize_weights(model_obj, weights, config=None):
             model_obj = model_obj(config)
         weights = model_obj.sanitize(weights)
     return weights
+
+
+def canonicalize_weight_keys(weights, expected_keys):
+    """Resolve common checkpoint namespace aliases against the model parameter set."""
+    canonicalized = {}
+    renamed = 0
+
+    for key, value in weights.items():
+        new_key = key
+
+        for source_prefix, target_prefix in WEIGHT_KEY_ALIASES:
+            if not key.startswith(source_prefix):
+                continue
+
+            candidate = target_prefix + key[len(source_prefix) :]
+            if (
+                candidate in expected_keys
+                and candidate not in weights
+                and candidate not in canonicalized
+            ):
+                new_key = candidate
+                renamed += 1
+            break
+
+        canonicalized[new_key] = value
+
+    if renamed:
+        logging.info("Canonicalized %d checkpoint weight key(s)", renamed)
+
+    return canonicalized
 
 
 def update_module_configs(model_config, model_class, config, modules):

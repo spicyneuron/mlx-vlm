@@ -10,6 +10,7 @@ from mlx_lm.utils import quantize_model
 
 from mlx_vlm.utils import (
     StoppingCriteria,
+    canonicalize_weight_keys,
     get_class_predicate,
     load,
     load_image,
@@ -102,6 +103,42 @@ def test_sanitize_weights():
     config = {"test": "config"}
     sanitized = sanitize_weights(DummyModel, weights, config)
     assert sanitized["sanitized"] is True
+
+
+def test_canonicalize_weight_keys_remaps_common_aliases():
+    weights = {
+        "model.language_model.visual.blocks.0.weight": mx.array([1]),
+        "language_model.model.visual.blocks.1.weight": mx.array([2]),
+        "model.visual.blocks.2.weight": mx.array([3]),
+        "model.language_model.layers.0.weight": mx.array([4]),
+        "lm_head.weight": mx.array([5]),
+    }
+    expected_keys = {
+        "vision_tower.blocks.0.weight",
+        "vision_tower.blocks.1.weight",
+        "vision_tower.blocks.2.weight",
+        "language_model.model.layers.0.weight",
+        "language_model.lm_head.weight",
+    }
+
+    canonicalized = canonicalize_weight_keys(weights, expected_keys)
+
+    assert set(canonicalized) == expected_keys
+
+
+def test_canonicalize_weight_keys_keeps_existing_targets_and_unknown_aliases():
+    weights = {
+        "lm_head.weight": mx.array([1]),
+        "language_model.lm_head.weight": mx.array([2]),
+        "model.language_model.visual.blocks.0.weight": mx.array([3]),
+    }
+    expected_keys = {"language_model.lm_head.weight"}
+
+    canonicalized = canonicalize_weight_keys(weights, expected_keys)
+
+    assert "language_model.lm_head.weight" in canonicalized
+    assert "lm_head.weight" in canonicalized
+    assert "model.language_model.visual.blocks.0.weight" in canonicalized
 
 
 def test_update_module_configs():
