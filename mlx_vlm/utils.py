@@ -60,6 +60,8 @@ DOWN_PROJ_SUFFIXES = (
     (".down_proj", ".down_proj.weight"),
 )
 
+WEIGHT_DIAGNOSTIC_LIMIT = 8
+
 # Constants
 MODEL_REMAPPING = {
     "llava_qwen2": "fastvlm",  # Apple's FastVLM, note it's different to the one below
@@ -131,6 +133,23 @@ def skip_multimodal_module(path: str) -> bool:
         or "code_predictor" in path
         or "img_projector" in path
     )
+
+
+def get_class_predicate(skip_vision: bool, weights=None, quantization=None):
+    def predicate(path, module):
+        if skip_multimodal_module(path) and skip_vision:
+            return False
+        if quantization is not None and path in quantization:
+            return quantization[path]
+        if not hasattr(module, "to_quantized"):
+            return False
+        if hasattr(module, "weight") and module.weight.size % 64 != 0:
+            return False
+        if weights is None:
+            return True
+        return f"{path}.scales" in weights
+
+    return predicate
 
 
 def get_model_and_args(config: dict):
@@ -326,28 +345,18 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         # Handle legacy models which may or may not have vision quantized
         # TODO: Re-upload the models with the new quantization config and remove this
         skip_vision = config.get("vision_config", {}).get("skip_vision", False)
-
-        def get_class_predicate(p, m):
-            # Always skip vision and audio models
-            if skip_multimodal_module(p) and skip_vision:
-                return False
-            # Handle custom per layer quantizations
-            if p in config["quantization"]:
-                return config["quantization"][p]
-            if not hasattr(m, "to_quantized"):
-                return False
-            # Skip layers not divisible by 64
-            if hasattr(m, "weight") and m.weight.size % 64 != 0:
-                return False
-            # Handle legacy models which may not have everything quantized
-            return f"{p}.scales" in weights
+        class_predicate = get_class_predicate(
+            skip_vision=skip_vision,
+            weights=weights,
+            quantization=config["quantization"],
+        )
 
         nn.quantize(
             model,
             group_size=quantization["group_size"],
             bits=quantization["bits"],
             mode=quantization.get("mode", "affine"),
-            class_predicate=get_class_predicate,
+            class_predicate=class_predicate,
         )
 
     if kwargs.get("quantize_activations", False):
@@ -358,6 +367,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             )
         model = quantize_activations(model)
 
+    ensure_matching_weights(dict(tree_flatten(model.parameters())), weights)
     model.load_weights(list(weights.items()))
 
     if not lazy:
@@ -510,6 +520,102 @@ def rename_down_proj_weights(weights, expected_keys):
             break
 
     return renamed_weights, renames
+
+
+def inspect_weight_compatibility(expected_weights, weights):
+    expected_keys = set(expected_weights)
+    provided_keys = set(weights)
+
+    missing = sorted(expected_keys - provided_keys)
+    unexpected = sorted(provided_keys - expected_keys)
+    shape_mismatches = []
+
+    for key in sorted(expected_keys & provided_keys):
+        expected_shape = tuple(expected_weights[key].shape)
+        provided_shape = tuple(weights[key].shape)
+        if expected_shape != provided_shape:
+            shape_mismatches.append((key, expected_shape, provided_shape))
+
+    suggestions = []
+    for key in unexpected:
+        for source_prefix, target_prefix in WEIGHT_KEY_ALIASES:
+            if not key.startswith(source_prefix):
+                continue
+
+            candidate = target_prefix + key[len(source_prefix) :]
+            if candidate in expected_keys:
+                suggestions.append((key, candidate))
+            break
+
+    return {
+        "expected_count": len(expected_keys),
+        "provided_count": len(provided_keys),
+        "missing": missing,
+        "unexpected": unexpected,
+        "shape_mismatches": shape_mismatches,
+        "suggestions": suggestions,
+    }
+
+
+def format_weight_compatibility_error(issues, limit=WEIGHT_DIAGNOSTIC_LIMIT):
+    lines = [
+        "Checkpoint weights do not match the instantiated model after sanitize/canonicalize/adapt passes.",
+        f"Expected {issues['expected_count']} tensor(s), got {issues['provided_count']} tensor(s).",
+        (
+            "Missing: "
+            f"{len(issues['missing'])}, unexpected: {len(issues['unexpected'])}, "
+            f"shape mismatches: {len(issues['shape_mismatches'])}."
+        ),
+    ]
+
+    if issues["missing"]:
+        lines.append("Missing keys:")
+        lines.extend(f"  {key}" for key in issues["missing"][:limit])
+        if len(issues["missing"]) > limit:
+            lines.append(f"  ... and {len(issues['missing']) - limit} more")
+
+    if issues["unexpected"]:
+        lines.append("Unexpected keys:")
+        lines.extend(f"  {key}" for key in issues["unexpected"][:limit])
+        if len(issues["unexpected"]) > limit:
+            lines.append(f"  ... and {len(issues['unexpected']) - limit} more")
+
+    if issues["shape_mismatches"]:
+        lines.append("Shape mismatches:")
+        lines.extend(
+            f"  {key}: expected {expected_shape}, got {provided_shape}"
+            for key, expected_shape, provided_shape in issues["shape_mismatches"][
+                :limit
+            ]
+        )
+        if len(issues["shape_mismatches"]) > limit:
+            lines.append(
+                f"  ... and {len(issues['shape_mismatches']) - limit} more"
+            )
+
+    if issues["suggestions"]:
+        lines.append("Possible remaps:")
+        lines.extend(
+            f"  {source_key} -> {target_key}"
+            for source_key, target_key in issues["suggestions"][:limit]
+        )
+        if len(issues["suggestions"]) > limit:
+            lines.append(f"  ... and {len(issues['suggestions']) - limit} more")
+
+    lines.append(
+        "This usually means the checkpoint needs an additional sanitize rule or structural adapter."
+    )
+    return "\n".join(lines)
+
+
+def ensure_matching_weights(expected_weights, weights):
+    issues = inspect_weight_compatibility(expected_weights, weights)
+    if (
+        issues["missing"]
+        or issues["unexpected"]
+        or issues["shape_mismatches"]
+    ):
+        raise ValueError(format_weight_compatibility_error(issues))
 
 
 def update_module_configs(model_config, model_class, config, modules):
