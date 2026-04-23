@@ -54,6 +54,7 @@ from .vision_cache import VisionFeatureCache
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
+DEFAULT_SERVER_MAX_TOKENS = int(os.environ.get("MAX_TOKENS", DEFAULT_MAX_TOKENS))
 
 
 def get_prefill_step_size():
@@ -111,7 +112,7 @@ def get_top_logprobs_k():
 class GenerationArguments:
     """Arguments for a generation request."""
 
-    max_tokens: int = DEFAULT_MAX_TOKENS
+    max_tokens: int = DEFAULT_SERVER_MAX_TOKENS
     temperature: float = DEFAULT_TEMPERATURE
     top_p: float = DEFAULT_TOP_P
     top_k: int = 0
@@ -760,7 +761,7 @@ def process_tool_calls(model_output: str, tool_module, tools):
 def _build_gen_args(request) -> GenerationArguments:
     """Build GenerationArguments from an OpenAIRequest or ChatRequest."""
     max_tokens = getattr(request, "max_tokens", None) or getattr(
-        request, "max_output_tokens", DEFAULT_MAX_TOKENS
+        request, "max_output_tokens", DEFAULT_SERVER_MAX_TOKENS
     )
     logit_bias = getattr(request, "logit_bias", None)
     if logit_bias is not None and isinstance(logit_bias, dict):
@@ -1144,7 +1145,8 @@ class OpenAIRequest(FlexibleBaseModel):
     )
     model: str = Field(..., description="The model to use for generation.")
     max_output_tokens: int = Field(
-        DEFAULT_MAX_TOKENS, description="Maximum number of tokens to generate."
+        DEFAULT_SERVER_MAX_TOKENS,
+        description="Maximum number of tokens to generate.",
     )
     temperature: float = Field(
         DEFAULT_TEMPERATURE, description="Temperature for sampling."
@@ -1330,7 +1332,8 @@ class VLMRequest(FlexibleBaseModel):
         None, description="The path to the adapter weights."
     )
     max_tokens: int = Field(
-        DEFAULT_MAX_TOKENS, description="Maximum number of tokens to generate."
+        DEFAULT_SERVER_MAX_TOKENS,
+        description="Maximum number of tokens to generate.",
     )
     temperature: float = Field(
         DEFAULT_TEMPERATURE, description="Temperature for sampling."
@@ -2514,6 +2517,12 @@ def main():
         help="Pre-load a model at startup (e.g. mlx-community/Qwen2.5-VL-3B-Instruct-4bit).",
     )
     parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="Default max tokens for requests that do not set one.",
+    )
+    parser.add_argument(
         "--adapter-path",
         type=str,
         default=None,
@@ -2609,6 +2618,8 @@ def main():
         os.environ["MLX_VLM_PRELOAD_MODEL"] = args.model
         if args.adapter_path:
             os.environ["MLX_VLM_PRELOAD_ADAPTER"] = args.adapter_path
+    if args.max_tokens is not None:
+        os.environ["MAX_TOKENS"] = str(args.max_tokens)
     os.environ["MLX_VLM_VISION_CACHE_SIZE"] = str(args.vision_cache_size)
     if args.draft_model:
         os.environ["MLX_VLM_DRAFT_MODEL"] = args.draft_model
