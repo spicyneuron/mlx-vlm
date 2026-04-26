@@ -257,7 +257,9 @@ class Qwen3VLModel(nn.Module):
             cache = [None] * len(self.layers)
 
         if mask is None:
-            mask = create_attention_mask(h, cache)
+            mask = create_attention_mask(
+                h, cache[0] if cache and cache[0] is not None else cache
+            )
         for layer_idx, (layer, c) in enumerate(zip(self.layers, cache)):
             h = layer(h, mask, c, position_ids)
             # Add deepstack visual embeds
@@ -279,21 +281,27 @@ class Qwen3VLModel(nn.Module):
         visual_pos_masks: mx.array,
         visual_embeds: mx.array,
     ):
+
         batch_size = hidden_states.shape[0]
 
         updated_batches = []
+        offset = 0
         for b in range(batch_size):
             batch_mask = visual_pos_masks[b]
             batch_hidden = hidden_states[b]
 
             batch_indices = mx.array(np.where(batch_mask)[0], dtype=mx.uint32)
 
-            if len(batch_indices) == 0:
+            n_visual = len(batch_indices)
+            if n_visual == 0:
                 updated_batches.append(batch_hidden)
                 continue
 
+            sample_embeds = visual_embeds[offset : offset + n_visual]
+            offset += n_visual
+
             batch_result = mx.array(batch_hidden)  # avoid modifying in-place
-            batch_result = batch_result.at[batch_indices].add(visual_embeds)
+            batch_result = batch_result.at[batch_indices].add(sample_embeds)
 
             updated_batches.append(batch_result)
 
@@ -503,33 +511,28 @@ class LanguageModel(nn.Module):
     ):
         # Slicing visual_pos_masks when prefilling
         n_to_process = kwargs.get("n_to_process", None)
-        if n_to_process is not None:
+        if n_to_process is not None and visual_pos_masks is not None:
             visual_pos_masks = visual_pos_masks[:, n_to_process:]
 
         position_ids = kwargs.pop("position_ids", None)
         pixel_values = kwargs.pop("pixel_values", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
+        rope_deltas_kw = kwargs.pop("rope_deltas", None)
         # reset rope_deltas and position_ids when processing a new image/video
         if pixel_values is not None:
             self._rope_deltas = None
             self._position_ids = None
 
+        # Use ``cache._idx`` — the Python-int token counter — instead of
+        # syncing on ``cache[0].offset``. See Qwen2.5-VL for details.
         cache_offset = 0
         cache_offset_array = None  # For per-sequence offsets in batch mode
         if cache and cache[0] is not None:
-            offset = cache[0].offset
-            if isinstance(offset, int):
-                cache_offset = offset
-            elif isinstance(offset, mx.array):
-                if offset.ndim == 0:
-                    cache_offset = offset.item()
-                else:
-                    # Per-sequence offsets for batched generation
-                    cache_offset_array = offset
-                    cache_offset = offset[0].item()  # For compatibility checks
-            else:
-                raise ValueError(f"Unexpected cache offset type: {type(offset)}")
+            c0 = cache[0]
+            cache_offset = c0._idx if hasattr(c0, "_idx") else c0.offset
+            if isinstance(c0.offset, mx.array) and c0.offset.ndim > 0:
+                cache_offset_array = c0.offset
 
         # Check if mask shape matches input shape (for chunked prefill compatibility)
         rope_mask = mask
@@ -544,9 +547,7 @@ class LanguageModel(nn.Module):
                 or cache is None
             )
             if recalc_condition:
-                # Only reuse _position_ids for chunked prefill (cache_offset > 0)
-                # For new prompts (cache_offset == 0), always recalculate
-                if self._position_ids is not None and cache_offset > 0:
+                if self._position_ids is not None:
                     seq_length = inputs.shape[1]
                     position_ids = self._position_ids[
                         :, :, cache_offset : cache_offset + seq_length
@@ -568,9 +569,11 @@ class LanguageModel(nn.Module):
                 else:
                     base_offset = mx.array(cache_offset)
 
-                # Add rope_deltas if available
-                if self._rope_deltas is not None:
-                    rope_delta = self._rope_deltas
+                rope_delta_src = (
+                    rope_deltas_kw if rope_deltas_kw is not None else self._rope_deltas
+                )
+                if rope_delta_src is not None:
+                    rope_delta = rope_delta_src
                     if rope_delta.ndim == 0:
                         rope_delta = mx.expand_dims(rope_delta, axis=0)
                     if rope_delta.shape[0] < batch_size:
