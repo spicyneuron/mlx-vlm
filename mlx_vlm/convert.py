@@ -122,7 +122,50 @@ QUANT_MODES = {
     if mode != "affine"
 }
 
-ParsedOverride = tuple[re.Pattern, Union[int, str]]
+OverrideValue = Union[int, str, tuple[int, int]]
+ParsedOverride = tuple[re.Pattern, OverrideValue]
+
+
+def int_override_parts(value: OverrideValue) -> Optional[tuple[int, Optional[int]]]:
+    if isinstance(value, int):
+        return value, None
+    if isinstance(value, tuple):
+        return value
+    return None
+
+
+def format_override_value(value: OverrideValue) -> str:
+    int_parts = int_override_parts(value)
+    if int_parts is None:
+        return value
+    bits, group_size = int_parts
+    if group_size is None:
+        return str(bits)
+    return f"{bits},{group_size}"
+
+
+def resolve_override_quant_params(
+    value: OverrideValue,
+    group_size: int,
+    int_group_size: Optional[int] = None,
+) -> Optional[dict]:
+    if isinstance(value, str) and value in QUANT_MODES:
+        return dict(QUANT_MODES[value])
+    int_parts = int_override_parts(value)
+    if int_parts is None:
+        return None
+
+    bits, override_group_size = int_parts
+    resolved_group_size = override_group_size
+    if resolved_group_size is None:
+        resolved_group_size = (
+            group_size if int_group_size is None else int_group_size
+        )
+    return {
+        "group_size": resolved_group_size,
+        "bits": bits,
+        "mode": "affine",
+    }
 
 
 def warn_mode_override_conflicts(
@@ -153,7 +196,7 @@ def warn_mode_override_conflicts(
 def warn_mixed_mode_overrides(q_mode: str, overrides: list[ParsedOverride]) -> None:
     if q_mode == "affine":
         return
-    if not any(isinstance(value, int) for _, value in overrides):
+    if not any(int_override_parts(value) is not None for _, value in overrides):
         return
     print(
         f"[WARN] Integer --q-override values force affine quantization on "
@@ -172,17 +215,64 @@ def parse_overrides(overrides: list[str]) -> list[ParsedOverride]:
             compiled = re.compile(pattern)
         except re.error as e:
             raise ValueError(f"Invalid regex in override '{pattern}': {e}")
-        if value in FLOAT_DTYPES or value in QUANT_MODES:
-            parsed.append((compiled, value))
-        else:
-            try:
-                parsed.append((compiled, int(value)))
-            except ValueError:
-                valid = list(FLOAT_DTYPES) + list(QUANT_MODES)
+
+        parts = value.split(",")
+        if len(parts) > 2:
+            raise ValueError(
+                f"Invalid override value '{value}'. Expected VALUE or BITS,GROUP_SIZE"
+            )
+
+        base_value = parts[0]
+        group_size = None
+        if len(parts) == 2:
+            if not parts[1]:
                 raise ValueError(
-                    f"Invalid override value '{value}'. "
-                    f"Expected an integer (bit width) or one of {valid}"
+                    f"Invalid override value '{value}'. Missing group size."
                 )
+            try:
+                group_size = int(parts[1])
+            except ValueError:
+                raise ValueError(
+                    f"Invalid group size '{parts[1]}' in override '{entry}'. "
+                    "Expected an integer."
+                )
+            if group_size <= 0:
+                raise ValueError(
+                    f"Invalid group size '{group_size}' in override '{entry}'. "
+                    "Expected a positive integer."
+                )
+
+        if base_value in FLOAT_DTYPES:
+            if group_size is not None:
+                raise ValueError(
+                    f"Invalid override value '{value}'. Group size is only "
+                    "supported with integer bit-width overrides."
+                )
+            parsed.append((compiled, base_value))
+            continue
+
+        if base_value in QUANT_MODES:
+            if group_size is not None:
+                raise ValueError(
+                    f"Invalid override value '{value}'. Group size cannot be "
+                    "combined with quant modes."
+                )
+            parsed.append((compiled, base_value))
+            continue
+
+        try:
+            bits = int(base_value)
+        except ValueError:
+            valid = list(FLOAT_DTYPES) + list(QUANT_MODES)
+            raise ValueError(
+                f"Invalid override value '{value}'. "
+                f"Expected an integer (bit width), BITS,GROUP_SIZE, or one of {valid}"
+            )
+
+        if group_size is None:
+            parsed.append((compiled, bits))
+        else:
+            parsed.append((compiled, (bits, group_size)))
     return parsed
 
 
@@ -195,18 +285,14 @@ def build_override_predicate(
     def predicate(path, module):
         for regex, value in overrides:
             if regex.search(path):
-                if value in QUANT_MODES:
-                    return dict(QUANT_MODES[value])
-                if isinstance(value, str):
-                    return False
-                resolved_group_size = (
-                    group_size if int_group_size is None else int_group_size
+                resolved = resolve_override_quant_params(
+                    value,
+                    group_size,
+                    int_group_size=int_group_size,
                 )
-                return {
-                    "group_size": resolved_group_size,
-                    "bits": value,
-                    "mode": "affine",
-                }
+                if resolved is None:
+                    return False
+                return resolved
         if base_predicate is not None:
             return base_predicate(path, module)
         return True
@@ -215,7 +301,11 @@ def build_override_predicate(
 
 
 def apply_float_overrides(model, overrides):
-    float_overrides = [(r, FLOAT_DTYPES[v]) for r, v in overrides if v in FLOAT_DTYPES]
+    float_overrides = [
+        (r, FLOAT_DTYPES[v])
+        for r, v in overrides
+        if isinstance(v, str) and v in FLOAT_DTYPES
+    ]
     if not float_overrides:
         return
 
@@ -231,6 +321,38 @@ def apply_float_overrides(model, overrides):
         return value
 
     model.update(tree_map_with_path(maybe_cast, model.parameters()))
+
+
+def validate_quant_override_group_sizes(
+    model: nn.Module,
+    overrides: list[ParsedOverride],
+    group_size: int,
+    int_group_size: Optional[int] = None,
+) -> None:
+    for regex, value in overrides:
+        quant_params = resolve_override_quant_params(
+            value,
+            group_size,
+            int_group_size=int_group_size,
+        )
+        if quant_params is None:
+            continue
+
+        for path, module in model.named_modules():
+            if not hasattr(module, "to_quantized") or not hasattr(module, "weight"):
+                continue
+            match_path = f"model.{path}" if path else "model"
+            if not (regex.search(path) or regex.search(match_path)):
+                continue
+
+            input_dim = module.weight.shape[-1]
+            override_group_size = quant_params["group_size"]
+            if input_dim % override_group_size != 0:
+                raise ValueError(
+                    f"--q-override {regex.pattern}={format_override_value(value)} "
+                    f"matched module '{match_path}' with input dimension {input_dim}, "
+                    f"which is not divisible by group_size {override_group_size}."
+                )
 
 
 def convert(
@@ -281,6 +403,13 @@ def convert(
         int_override_group_size = (
             q_group_size if q_mode == "affine" else affine_group_size
         )
+        if quantize:
+            validate_quant_override_group_sizes(
+                model,
+                parsed_overrides,
+                q_group_size,
+                int_group_size=int_override_group_size,
+            )
         quant_predicate = build_override_predicate(
             parsed_overrides,
             quant_predicate,
@@ -417,7 +546,7 @@ def configure_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--quant-predicate",
-        help=f"Mixed-bit quantization recipe.",
+        help="Mixed-bit quantization recipe.",
         choices=QUANT_RECIPES,
         type=str,
         required=False,
@@ -427,9 +556,10 @@ def configure_parser() -> argparse.ArgumentParser:
         help=(
             "Per-layer quantization override as PATTERN=VALUE (repeatable). "
             "PATTERN is a regex matched against the module path. "
-            "VALUE is a bit width (int), dtype (float16, bfloat16, float32), "
-            "or quant mode (mxfp4, nvfp4, mxfp8). Integer bit overrides are "
-            "affine for matching layers."
+            "VALUE is a bit width (int or int,group_size), "
+            "dtype (float16, bfloat16, float32), or quant mode "
+            "(mxfp4, nvfp4, mxfp8). Integer bit overrides are affine for "
+            "matching layers."
         ),
         action="append",
         default=None,

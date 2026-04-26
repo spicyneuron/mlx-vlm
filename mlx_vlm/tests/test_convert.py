@@ -8,6 +8,7 @@ from mlx_vlm.convert import (
     apply_float_overrides,
     build_override_predicate,
     parse_overrides,
+    validate_quant_override_group_sizes,
 )
 
 
@@ -25,6 +26,11 @@ def test_parse_overrides_float_dtypes():
     for dtype in ("float16", "bfloat16", "float32"):
         result = parse_overrides([f"embed_tokens={dtype}"])
         assert result[0][1] == dtype
+
+
+def test_parse_overrides_int_with_group_size():
+    result = parse_overrides(["lm_head=8,32"])
+    assert result[0][1] == (8, 32)
 
 
 def test_parse_overrides_multiple():
@@ -56,6 +62,12 @@ def test_parse_overrides_quant_mode():
         assert result[0][1] == mode
 
 
+def test_parse_overrides_rejects_non_int_with_group_size():
+    for entry in ("down_proj=mxfp4,32", "embed_tokens=float16,32"):
+        with pytest.raises(ValueError, match="Group size"):
+            parse_overrides([entry])
+
+
 def test_parse_overrides_invalid_value():
     with pytest.raises(ValueError, match="Invalid override value"):
         parse_overrides(["lm_head=garbage"])
@@ -79,7 +91,10 @@ def test_override_float_returns_false():
 
 def test_override_no_match_delegates():
     overrides = [(re.compile("lm_head"), 8)]
-    base = lambda p, m: {"group_size": 64, "bits": 4, "mode": "affine"}
+
+    def base(_path, _module):
+        return {"group_size": 64, "bits": 4, "mode": "affine"}
+
     pred = build_override_predicate(overrides, base, 64)
     result = pred("model.layers.0.mlp.down_proj", None)
     assert result == {"group_size": 64, "bits": 4, "mode": "affine"}
@@ -121,6 +136,22 @@ def test_override_group_size_passthrough():
     assert pred("model.lm_head", None)["group_size"] == 32
 
 
+def test_override_int_uses_explicit_int_group_size():
+    overrides = [(re.compile("lm_head"), 8)]
+    pred = build_override_predicate(overrides, None, 32, int_group_size=64)
+    assert pred("model.lm_head", None)["group_size"] == 64
+
+
+def test_override_int_with_group_size_uses_override_value():
+    overrides = [(re.compile("lm_head"), (8, 32))]
+    pred = build_override_predicate(overrides, None, 64)
+    assert pred("model.lm_head", None) == {
+        "group_size": 32,
+        "bits": 8,
+        "mode": "affine",
+    }
+
+
 # -- apply_float_overrides ----------------------------------------------------
 
 
@@ -128,6 +159,12 @@ class _Wrapper(nn.Module):
     def __init__(self):
         super().__init__()
         self.linear = nn.Linear(64, 64)
+
+
+class _SmallWrapper(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(48, 64)
 
 
 def test_apply_float_overrides_casts():
@@ -151,3 +188,34 @@ def test_apply_float_overrides_skips_int():
     overrides = [(re.compile("linear"), 8)]
     apply_float_overrides(model, overrides)
     assert model.linear.weight.dtype == original_dtype
+
+
+def test_apply_float_overrides_skips_int_with_group_size():
+    model = _Wrapper()
+    original_dtype = model.linear.weight.dtype
+    overrides = [(re.compile("linear"), (8, 32))]
+    apply_float_overrides(model, overrides)
+    assert model.linear.weight.dtype == original_dtype
+
+
+# -- validate_quant_override_group_sizes --------------------------------------
+
+
+def test_validate_override_group_size_accepts_divisible_module():
+    model = _Wrapper()
+    overrides = parse_overrides(["linear=8,32"])
+    validate_quant_override_group_sizes(model, overrides, 64)
+
+
+def test_validate_override_group_size_errors_for_non_divisible_module():
+    model = _SmallWrapper()
+    overrides = parse_overrides(["linear=8,64"])
+    with pytest.raises(ValueError, match="not divisible by group_size 64"):
+        validate_quant_override_group_sizes(model, overrides, 64)
+
+
+def test_validate_quant_mode_override_group_size_errors():
+    model = _SmallWrapper()
+    overrides = parse_overrides(["linear=mxfp4"])
+    with pytest.raises(ValueError, match="not divisible by group_size 32"):
+        validate_quant_override_group_sizes(model, overrides, 64)
