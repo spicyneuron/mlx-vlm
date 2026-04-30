@@ -15,6 +15,7 @@ from mlx_vlm.generate import (
     BatchStats,
     GenerationBatch,
     GenerationResult,
+    _iter_cache_eval_arrays,
     _left_pad_prompts,
     normalize_resize_shape,
 )
@@ -159,6 +160,34 @@ def mock_processor():
 # ============================================================================
 # Tests for Dataclasses
 # ============================================================================
+
+
+class TestCacheEvalTargets:
+    """Tests for async-eval cache target collection."""
+
+    def test_walks_nested_cache_attrs_in_order(self):
+        offset = mx.array([1])
+        left_padding = mx.array([0])
+        lengths = mx.array([2])
+        private_lengths = mx.array([3])
+        target = SimpleNamespace(_lengths=private_lengths, offset=1)
+        root = SimpleNamespace(
+            offset=offset,
+            left_padding=left_padding,
+            lengths=lengths,
+            _lengths=None,
+            caches=[SimpleNamespace(caches=[target])],
+        )
+
+        eval_targets = list(_iter_cache_eval_arrays(root))
+
+        assert eval_targets == [offset, left_padding, lengths, private_lengths]
+
+    def test_handles_missing_or_empty_nested_caches(self):
+        offset = mx.array([1])
+        root = SimpleNamespace(offset=offset, caches=None)
+
+        assert list(_iter_cache_eval_arrays(root)) == [offset]
 
 
 class TestGenerationResult:

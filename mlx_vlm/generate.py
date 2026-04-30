@@ -49,6 +49,19 @@ DEFAULT_THINKING_END_TOKEN = "</think>"
 DEFAULT_QUANTIZED_KV_START = 5000
 DEFAULT_PREFILL_STEP_SIZE = 2048
 
+# BatchRotatingKVCache mutates this during right-padded prefill.
+_CACHE_EVAL_ATTRS = ("offset", "left_padding", "lengths", "_lengths")
+
+
+def _iter_cache_eval_arrays(cache_obj: Any) -> Generator[mx.array, None, None]:
+    for attr in _CACHE_EVAL_ATTRS:
+        val = getattr(cache_obj, attr, None)
+        if isinstance(val, mx.array):
+            yield val
+
+    for sub in getattr(cache_obj, "caches", None) or ():
+        yield from _iter_cache_eval_arrays(sub)
+
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
@@ -571,7 +584,7 @@ def _dflash_rounds_batch(
     lm = model.language_model if hasattr(model, "language_model") else model
     if not hasattr(lm, "rollback_speculative_cache"):
         raise RuntimeError(
-            f"{type(lm).__name__} does not implement " "rollback_speculative_cache."
+            f"{type(lm).__name__} does not implement rollback_speculative_cache."
         )
 
     B = first_bonus.shape[0]
@@ -1583,6 +1596,10 @@ class GenerationBatch:
         else:
             self._next_top_idx = None
             self._next_top_lp = None
+
+        # Keep batch cache position arrays from accumulating lazy graphs.
+        for c in self.prompt_cache:
+            eval_targets.extend(_iter_cache_eval_arrays(c))
 
         mx.async_eval(*eval_targets)
 
