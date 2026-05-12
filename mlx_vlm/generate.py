@@ -22,6 +22,8 @@ from transformers import PreTrainedTokenizer
 from . import apc as _apc
 from .models import cache
 from .prompt_utils import apply_chat_template
+from .speculative.utils import format_speculative_stats, run_speculative_rounds
+from .tokenizer_utils import make_streaming_detokenizer
 from .turboquant import BatchTurboQuantKVCache, TurboQuantKVCache, turboquant_enabled
 from .utils import (
     StoppingCriteria,
@@ -223,9 +225,11 @@ def parse_arguments():
     parser.add_argument(
         "--draft-kind",
         type=str,
-        default="dflash",
+        default=None,
+        choices=["dflash", "mtp"],
         help="Drafter family. Supported: 'dflash' (Qwen3.5 DFlash), "
-        "'mtp' (Gemma 4 Multi-Token Prediction / Assistant model).",
+        "'mtp' (Gemma 4 Multi-Token Prediction / Assistant model). "
+        "Default: auto-detected from the drafter's HF model_type.",
     )
     parser.add_argument(
         "--draft-block-size",
@@ -450,640 +454,6 @@ def _prime_cached_prefix_rope_state(
     return True
 
 
-def _speculative_walk(
-    draft_tokens: mx.array,
-    target_tokens: mx.array,
-    budget: int,
-) -> Tuple[int, List[int]]:
-    """Exact-greedy speculative-decoding walk.
-
-    Accept drafted tokens up to the first mismatch with the target's
-    greedy choice, then take the target's bonus at that position.
-    Returns ``(accepted_count, new_tokens)`` with ``new_tokens``
-    truncated to ``budget``.
-    """
-    n_draft = draft_tokens.shape[1]
-    combined = mx.concatenate(
-        [draft_tokens.reshape(-1), target_tokens.reshape(-1)]
-    ).tolist()
-    d = combined[:n_draft]
-    t = combined[n_draft:]
-    accepted = next((i for i in range(len(d)) if d[i] != t[i]), len(d))
-    new_tokens = (d[:accepted] + [t[accepted]])[:budget]
-    return accepted, new_tokens
-
-
-def _speculative_walk_batch(
-    draft_tokens: mx.array,
-    target_tokens: mx.array,
-    budgets: List[int],
-) -> Tuple[List[int], List[List[int]]]:
-    """Per-sequence speculative walk for B > 1.
-
-    Returns ``(accepted_list, new_tokens_list)`` where each entry
-    corresponds to one sequence in the batch.
-    """
-    B = draft_tokens.shape[0]
-    n_draft = draft_tokens.shape[1]
-    combined = mx.concatenate(
-        [draft_tokens.reshape(B, -1), target_tokens.reshape(B, -1)], axis=1
-    ).tolist()
-    accepted_list: List[int] = []
-    new_tokens_list: List[List[int]] = []
-    for i in range(B):
-        d = combined[i][:n_draft]
-        t = combined[i][n_draft:]
-        acc = next((j for j in range(len(d)) if d[j] != t[j]), len(d))
-        new = (d[:acc] + [t[acc]])[: budgets[i]]
-        accepted_list.append(acc)
-        new_tokens_list.append(new)
-    return accepted_list, new_tokens_list
-
-
-def _mtp_rounds(
-    model: nn.Module,
-    draft_model: nn.Module,
-    prompt_cache: List[Any],
-    hidden: mx.array,
-    shared_kv_states: dict,
-    *,
-    first_bonus: int,
-    max_tokens: int,
-    sampler: Callable[[mx.array], mx.array],
-    draft_block_size: Optional[int] = None,
-    token_dtype: mx.Dtype = mx.int32,
-) -> Generator[Tuple[int, None], None, None]:
-    """Gemma 4 MTP (Single-Position Multi-Token) speculative-decoding round loop.
-
-    Mirrors ``_dflash_rounds`` but with three differences:
-    (1) the drafter consumes the target's last-layer hidden + last-layer
-    shared K/V per layer-type rather than concatenated multi-layer hiddens;
-    (2) ``draft_block`` is autoregressive (K small forwards) rather than a
-    single masked forward; (3) ``rollback_speculative_cache`` ignores
-    ``gdn_states`` (Gemma 4 has no SSM/GDN state).
-    """
-    lm = model.language_model if hasattr(model, "language_model") else model
-    if not hasattr(lm, "rollback_speculative_cache"):
-        raise RuntimeError(
-            f"{type(lm).__name__} does not implement rollback_speculative_cache. "
-            "MTP speculative decoding currently only supports gemma4."
-        )
-
-    block_total = (
-        draft_block_size
-        if draft_block_size is not None
-        else int(draft_model.config.block_size)
-    )
-    draft_model.reset(model)
-
-    # Hidden from prefill is full prompt-length; reduce to a single slot.
-    # The semantically-correct choice is the *last* prompt token's hidden:
-    # the just-sampled bonus is the next-token prediction from that position,
-    # so its embedding paired with that hidden is what the drafter expects.
-    # (HF's literal ``[:, n_last_matches:n_last_matches+1]`` with ``n_matches=0``
-    # on the first round picks position 0, which is BOS — they get away with
-    # it because subsequent rounds slice into the per-call verify hidden, but
-    # the round-1 acceptance is wasted. We don't replicate that quirk.)
-    if hidden.shape[1] > 1:
-        hidden = hidden[:, -1:, :]
-
-    kv_offset = int(prompt_cache[0].offset)
-    draft_model.set_shared_kv(shared_kv_states, kv_offset)
-
-    b = first_bonus
-    emitted = 1  # caller already yielded the first bonus
-
-    while emitted < max_tokens:
-        bs = min(block_total, max_tokens - emitted + 1)
-        if bs <= 1:
-            break
-
-        draft_tokens = draft_model.draft_block(
-            b, hidden, None, bs, sampler, token_dtype
-        )
-        mx.async_eval(draft_tokens)
-
-        with mx.stream(generation_stream):
-            verify_input = mx.concatenate(
-                [mx.array([[b]], dtype=token_dtype), draft_tokens], axis=1
-            )
-            verify_out = lm(
-                verify_input,
-                cache=prompt_cache,
-                return_hidden=True,
-                return_shared_kv=True,
-            )
-            hidden_full = verify_out.hidden_states[-1]  # [B, bs, backbone]
-            target_tokens = sampler(verify_out.logits)
-        mx.async_eval(target_tokens, hidden_full)
-
-        accepted, new_tokens = _speculative_walk(
-            draft_tokens, target_tokens, max_tokens - emitted
-        )
-        draft_model.accept_lens.append(accepted)
-
-        for tok in new_tokens:
-            yield tok, None
-            emitted += 1
-            if emitted >= max_tokens:
-                return
-
-        # Hidden for next round: pick the slot of the newly accepted bonus.
-        hidden = hidden_full[:, accepted : accepted + 1, :]
-        b = new_tokens[-1] if new_tokens else b
-
-        if accepted < bs - 1:
-            with mx.stream(generation_stream):
-                lm.rollback_speculative_cache(prompt_cache, None, accepted, bs)
-
-        # Slice shared_kv_states to the post-rollback length and rebind.
-        rejected = bs - (accepted + 1)
-        next_shared_kv = {}
-        for k, kv in verify_out.shared_kv_states.items():
-            K, V = kv
-            valid = K.shape[-2] - rejected
-            if valid <= 0 or valid >= K.shape[-2]:
-                next_shared_kv[k] = (
-                    (K, V) if valid >= K.shape[-2] else (K[..., :1, :], V[..., :1, :])
-                )
-            else:
-                next_shared_kv[k] = (K[..., :valid, :], V[..., :valid, :])
-        kv_offset = int(prompt_cache[0].offset)
-        draft_model.set_shared_kv(next_shared_kv, kv_offset)
-
-        if emitted % 256 == 0:
-            mx.clear_cache()
-
-
-def _mtp_rounds_batch(
-    model: nn.Module,
-    draft_model: nn.Module,
-    prompt_cache: List[Any],
-    hidden: mx.array,
-    shared_kv_states: dict,
-    *,
-    first_bonus: mx.array,
-    max_tokens: int,
-    sampler: Callable[[mx.array], mx.array],
-    draft_block_size: Optional[int] = None,
-    token_dtype: mx.Dtype = mx.int32,
-    stop_check: Optional[Callable[[int, int], bool]] = None,
-    eos_token_ids: Optional[set] = None,
-) -> Generator[Tuple[List[Optional[int]], None], None, None]:
-    """Batched Gemma 4 MTP round loop (B > 1).
-
-    Mirrors ``_dflash_rounds_batch``: per-row state tracked by original
-    index, continuous-batching filter on row finish. Differences vs DFlash
-    batched: drafter consumes ``shared_kv_states`` (per-layer-type K/V
-    snapshot) instead of multi-layer hidden capture, ``draft_block`` is
-    autoregressive, and the per-round ``shared_kv`` slicing mirrors
-    ``rollback_speculative_cache``'s tail-zero pattern so each row's KV
-    has the correct row-specific valid length.
-    """
-    lm = model.language_model if hasattr(model, "language_model") else model
-    if not hasattr(lm, "rollback_speculative_cache"):
-        raise RuntimeError(
-            f"{type(lm).__name__} does not implement rollback_speculative_cache."
-        )
-
-    B = first_bonus.shape[0]
-    block_total = (
-        draft_block_size
-        if draft_block_size is not None
-        else int(draft_model.config.block_size)
-    )
-    draft_model.reset(model)
-
-    # First-round hidden: prefill output may have shape [B, L, H]; reduce
-    # to a single slot per row (last prompt token's hidden — see comment in
-    # ``_mtp_rounds`` for rationale).
-    if hidden.shape[1] > 1:
-        hidden = hidden[:, -1:, :]
-
-    # Per-row state. ``positions`` is the absolute position id of each
-    # row's pending bonus (= row's logical KV length). All rows start at
-    # ``L_prefill`` and advance by ``accepted_i + 1`` per round.
-    offset0 = prompt_cache[0].offset
-    if isinstance(offset0, mx.array):
-        L_prefill = int(offset0.max().item())
-        positions = [int(x) for x in offset0.tolist()]
-    else:
-        L_prefill = int(offset0)
-        positions = [L_prefill] * B
-    draft_model.set_shared_kv(
-        shared_kv_states, kv_offset=L_prefill, position=mx.array(positions)
-    )
-
-    b = first_bonus.tolist()
-    emitted = [1] * B
-    finished = [False] * B
-    active_idx = list(range(B))
-
-    while len(active_idx) > 0:
-        remaining = [
-            max(1, max_tokens - emitted[active_idx[j]] + 1)
-            for j in range(len(active_idx))
-        ]
-        bs = min(block_total, min(remaining))
-        if bs <= 1:
-            break
-
-        n_active = len(active_idx)
-        b_active = [b[active_idx[j]] for j in range(n_active)]
-        b_arr = mx.array(b_active, dtype=token_dtype)
-
-        # Draft (autoregressive K-step). hidden / shared_kv state was set
-        # via set_shared_kv above; the drafter pulls it from there.
-        draft_tokens = draft_model.draft_block(
-            b_arr, hidden, None, bs, sampler, token_dtype
-        )
-        mx.async_eval(draft_tokens)
-
-        # Verify
-        with mx.stream(generation_stream):
-            verify_input = mx.concatenate([b_arr[:, None], draft_tokens], axis=1)
-            verify_out = lm(
-                verify_input,
-                cache=prompt_cache,
-                return_hidden=True,
-                return_shared_kv=True,
-            )
-            hidden_full = verify_out.hidden_states[-1]  # [B_active, bs, H]
-            target_tokens = sampler(verify_out.logits)
-        mx.async_eval(target_tokens, hidden_full)
-
-        # Walk per-row
-        budgets = [max_tokens - emitted[active_idx[j]] for j in range(n_active)]
-        accepted_list, new_tokens_list = _speculative_walk_batch(
-            draft_tokens, target_tokens, budgets
-        )
-        for a in accepted_list:
-            draft_model.accept_lens.append(a)
-
-        max_a = max(accepted_list)
-        accepted_arr = mx.array(accepted_list)
-
-        # Per-row hidden: each row picks its own accepted slot from
-        # hidden_full. Build [B_active, 1, H] with row-i's hidden at
-        # position accepted_list[i].
-        if max_a < bs - 1 or any(a < max_a for a in accepted_list):
-            row_idx = mx.arange(n_active)
-            col_idx = mx.array(accepted_list)
-            # gather: hidden_full[row_idx, col_idx, :] -> [B_active, H]
-            hidden = hidden_full[row_idx, col_idx, :][:, None, :]
-        else:
-            hidden = hidden_full[:, -1:, :]
-
-        # Emit (map active slots back to original indices)
-        max_new = max(len(nt) for nt in new_tokens_list) if new_tokens_list else 0
-        for pos in range(max_new):
-            tokens_out: List[Optional[int]] = [None] * B
-            for j in range(n_active):
-                orig = active_idx[j]
-                if pos < len(new_tokens_list[j]) and not finished[orig]:
-                    tok = new_tokens_list[j][pos]
-                    tokens_out[orig] = tok
-                    emitted[orig] += 1
-                    if emitted[orig] >= max_tokens:
-                        finished[orig] = True
-                    if eos_token_ids is not None and tok in eos_token_ids:
-                        finished[orig] = True
-                    if stop_check is not None and stop_check(orig, tok):
-                        finished[orig] = True
-            yield tokens_out, None
-
-        # Update bonus tokens and per-row positions
-        for j in range(n_active):
-            orig = active_idx[j]
-            if new_tokens_list[j]:
-                b[orig] = new_tokens_list[j][-1]
-            positions[orig] = positions[orig] + accepted_list[j] + 1
-
-        # Rollback target cache (uniform trim by ``bs - max_a - 1`` plus
-        # per-row tail-zero on rows that accepted less).
-        if max_a < bs - 1:
-            with mx.stream(generation_stream):
-                lm.rollback_speculative_cache(prompt_cache, None, accepted_arr, bs)
-
-        # Slice + tail-zero ``verify_out.shared_kv_states`` to match the
-        # post-rollback target cache. After this, all rows share the same
-        # tensor length but rows that accepted less have zeros in the tail
-        # positions [L_prefill_round + accepted_i + 1, L_prefill_round + max_a + 1).
-        rejected_global = bs - (max_a + 1)
-        next_shared_kv = {}
-        for k, kv in verify_out.shared_kv_states.items():
-            K, V = kv
-            valid = K.shape[-2] - rejected_global
-            if valid >= K.shape[-2]:
-                K_next, V_next = K, V
-            elif valid <= 0:
-                K_next = K[..., :1, :]
-                V_next = V[..., :1, :]
-            else:
-                K_next = K[..., :valid, :]
-                V_next = V[..., :valid, :]
-            # Per-row tail-zero on rows that accepted less than max_a.
-            if any(a < max_a for a in accepted_list):
-                # K_next/V_next shape: [B_active, H, valid, D]
-                # For row i, zero positions [valid - max_a + accepted_i, valid).
-                # (verify_start = valid - (max_a + 1), and tail begins at
-                # verify_start + accepted_i + 1 = valid - max_a + accepted_i.)
-                K_arr = mx.array(K_next)  # ensure materialized for slicing
-                V_arr = mx.array(V_next)
-                K_arr = mx.array(K_arr)
-                V_arr = mx.array(V_arr)
-                mask_rows = mx.arange(K_next.shape[-2])  # [valid]
-                # Build per-row mask: True where position should be kept.
-                # Shape [B_active, valid]. Row i keeps positions [0, valid - max_a + accepted_i).
-                keep_lens = mx.array(
-                    [valid - max_a + a for a in accepted_list], dtype=mx.int32
-                )  # [B_active]
-                keep_mask = mask_rows[None, :] < keep_lens[:, None]  # [B_active, valid]
-                keep_f = keep_mask.astype(K_next.dtype)[:, None, :, None]  # broadcast
-                K_next = K_next * keep_f
-                V_next = V_next * keep_f
-            next_shared_kv[k] = (K_next, V_next)
-
-        # Continuous batching: filter finished sequences. Only safe when
-        # the caches expose a .filter() method (e.g. BatchKVCache); the
-        # plain KVCache / RotatingKVCache do not, so we keep all rows
-        # in the batch and just stop emitting for finished rows. End the
-        # round-loop when every row has finished.
-        cache_filterable = all(hasattr(c, "filter") for c in prompt_cache)
-        if all(finished[active_idx[j]] for j in range(n_active)):
-            break
-        if cache_filterable:
-            keep_slots = [j for j in range(n_active) if not finished[active_idx[j]]]
-            if len(keep_slots) < n_active:
-                keep_mx = mx.array(keep_slots, dtype=mx.int32)
-                for c in prompt_cache:
-                    c.filter(keep_mx)
-                hidden = hidden[keep_mx]
-                for k in next_shared_kv:
-                    K_next, V_next = next_shared_kv[k]
-                    next_shared_kv[k] = (K_next[keep_mx], V_next[keep_mx])
-                active_idx = [active_idx[j] for j in keep_slots]
-
-        # Re-bind drafter with new shared_kv and per-row positions.
-        positions_active = [positions[active_idx[j]] for j in range(len(active_idx))]
-        offset0 = prompt_cache[0].offset
-        new_kv_offset = (
-            int(offset0.max().item()) if isinstance(offset0, mx.array) else int(offset0)
-        )
-        draft_model.set_shared_kv(
-            next_shared_kv,
-            kv_offset=new_kv_offset,
-            position=mx.array(positions_active),
-        )
-
-        if sum(emitted) % 256 == 0:
-            mx.clear_cache()
-
-
-def _dflash_rounds(
-    model: nn.Module,
-    draft_model: nn.Module,
-    prompt_cache: List[Any],
-    hidden: mx.array,
-    *,
-    first_bonus: int,
-    max_tokens: int,
-    sampler: Callable[[mx.array], mx.array],
-    draft_block_size: Optional[int] = None,
-    token_dtype: mx.Dtype = mx.int32,
-) -> Generator[Tuple[int, None], None, None]:
-    """DFlash speculative-decoding **round loop**.
-
-    draft → verify → walk → rollback. ``generate_step`` is responsible
-    for prefill, sampling the first bonus token, and packaging the
-    captured hidden states into ``hidden``.
-    """
-    lm = model.language_model if hasattr(model, "language_model") else model
-    if not hasattr(lm, "rollback_speculative_cache"):
-        raise RuntimeError(
-            f"{type(lm).__name__} does not implement rollback_speculative_cache. "
-            "Speculative decoding with a DFlash drafter currently only "
-            "supports mlx_vlm.models.qwen3_5."
-        )
-
-    target_layer_ids = list(draft_model.config.target_layer_ids)
-    block_total = (
-        draft_block_size
-        if draft_block_size is not None
-        else int(draft_model.config.block_size)
-    )
-    draft_cache = draft_model.reset(model)
-
-    b = first_bonus
-    emitted = 1  # the first bonus has already been yielded by the caller
-
-    while emitted < max_tokens:
-        bs = min(block_total, max_tokens - emitted + 1)
-        if bs <= 1:
-            break
-
-        draft_tokens = draft_model.draft_block(
-            b, hidden, draft_cache, bs, sampler, token_dtype
-        )
-        mx.async_eval(draft_tokens)
-
-        with mx.stream(generation_stream):
-            verify_input = mx.concatenate(
-                [mx.array([[b]], dtype=token_dtype), draft_tokens],
-                axis=1,
-            )
-            verify_out = lm(
-                verify_input,
-                cache=prompt_cache,
-                capture_layer_ids=target_layer_ids,
-            )
-            hidden = mx.concatenate(verify_out.hidden_states, axis=-1)
-            target_tokens = sampler(verify_out.logits)
-        mx.async_eval(target_tokens, hidden)
-
-        # Walk
-        accepted, new_tokens = _speculative_walk(
-            draft_tokens, target_tokens, max_tokens - emitted
-        )
-        draft_model.accept_lens.append(accepted)
-
-        # Emit
-        for tok in new_tokens:
-            yield tok, None
-            emitted += 1
-            if emitted >= max_tokens:
-                return
-
-        if accepted < bs - 1:
-            hidden = hidden[:, : accepted + 1, :]
-        b = new_tokens[-1] if new_tokens else b
-
-        if accepted < bs - 1:
-            with mx.stream(generation_stream):
-                lm.rollback_speculative_cache(
-                    prompt_cache, verify_out.gdn_states, accepted, bs
-                )
-
-        if emitted % 256 == 0:
-            mx.clear_cache()
-
-
-def _dflash_rounds_batch(
-    model: nn.Module,
-    draft_model: nn.Module,
-    prompt_cache: List[Any],
-    hidden: mx.array,
-    *,
-    first_bonus: mx.array,
-    max_tokens: int,
-    sampler: Callable[[mx.array], mx.array],
-    draft_block_size: Optional[int] = None,
-    token_dtype: mx.Dtype = mx.int32,
-    stop_check: Optional[Callable[[int, int], bool]] = None,
-) -> Generator[Tuple[List[Optional[int]], None], None, None]:
-    """Batch DFlash speculative-decoding round loop (B > 1).
-
-    Supports continuous batching: when a sequence finishes (EOS or
-    max_tokens), it is filtered out of the target caches and the
-    drafter cache is reinitialized for the new batch size.
-
-    ``stop_check(seq_idx, token_id) -> bool`` is an optional callback
-    that returns True to stop a sequence (e.g. EOS detection).
-
-    Yields ``(tokens_list, None)`` where ``tokens_list[i]`` is the
-    token for sequence ``i`` (or ``None`` if that sequence has nothing
-    to emit this step).
-    """
-    lm = model.language_model if hasattr(model, "language_model") else model
-    if not hasattr(lm, "rollback_speculative_cache"):
-        raise RuntimeError(
-            f"{type(lm).__name__} does not implement " "rollback_speculative_cache."
-        )
-
-    B = first_bonus.shape[0]
-    target_layer_ids = list(draft_model.config.target_layer_ids)
-    block_total = (
-        draft_block_size
-        if draft_block_size is not None
-        else int(draft_model.config.block_size)
-    )
-    draft_cache = draft_model.reset(model)
-
-    # Per-sequence state tracked by ORIGINAL index so the caller sees
-    # stable indices in the yielded token lists.
-    b = first_bonus.tolist()  # active bonus tokens
-    emitted = [1] * B
-    finished = [False] * B
-    active_idx = list(range(B))  # maps active-slot → original-index
-
-    def _reinit_drafter():
-        """Cold-restart the drafter cache after a batch change."""
-        nonlocal draft_cache
-        draft_cache = draft_model.make_cache()
-
-    total_emitted = sum(emitted)
-
-    while len(active_idx) > 0:
-        remaining = [
-            max(1, max_tokens - emitted[active_idx[j]] + 1)
-            for j in range(len(active_idx))
-        ]
-        bs = min(block_total, min(remaining))
-        if bs <= 1:
-            break
-
-        n_active = len(active_idx)
-        b_active = [b[active_idx[j]] for j in range(n_active)]
-        b_arr = mx.array(b_active, dtype=token_dtype)
-
-        # Draft
-        draft_tokens = draft_model.draft_block(
-            b_arr, hidden, draft_cache, bs, sampler, token_dtype
-        )
-        mx.async_eval(draft_tokens)
-
-        # Verify
-        with mx.stream(generation_stream):
-            verify_input = mx.concatenate([b_arr[:, None], draft_tokens], axis=1)
-            verify_out = lm(
-                verify_input,
-                cache=prompt_cache,
-                capture_layer_ids=target_layer_ids,
-            )
-            hidden_full = mx.concatenate(verify_out.hidden_states, axis=-1)
-            target_tokens = sampler(verify_out.logits)
-        mx.async_eval(target_tokens, hidden_full)
-
-        # Walk (per-sequence)
-        budgets = [max_tokens - emitted[active_idx[j]] for j in range(n_active)]
-        accepted_list, new_tokens_list = _speculative_walk_batch(
-            draft_tokens, target_tokens, budgets
-        )
-
-        min_accepted = min(accepted_list)
-        accepted_arr = mx.array(accepted_list)
-
-        if min_accepted < bs - 1:
-            max_a = int(accepted_arr.max().item())
-            hidden = hidden_full[:, : max_a + 1, :]
-        else:
-            max_a = bs - 1
-            hidden = hidden_full
-
-        for a in accepted_list:
-            draft_model.accept_lens.append(a)
-
-        # Emit (map active slots back to original indices)
-        max_new = max(len(nt) for nt in new_tokens_list) if new_tokens_list else 0
-        for pos in range(max_new):
-            tokens_out: List[Optional[int]] = [None] * B
-            for j in range(n_active):
-                orig = active_idx[j]
-                if pos < len(new_tokens_list[j]) and not finished[orig]:
-                    tok = new_tokens_list[j][pos]
-                    tokens_out[orig] = tok
-                    emitted[orig] += 1
-                    if emitted[orig] >= max_tokens:
-                        finished[orig] = True
-                    if stop_check is not None and stop_check(orig, tok):
-                        finished[orig] = True
-            yield tokens_out, None
-
-        # Update bonus tokens
-        for j in range(n_active):
-            orig = active_idx[j]
-            if new_tokens_list[j]:
-                b[orig] = new_tokens_list[j][-1]
-
-        if min_accepted < bs - 1:
-            with mx.stream(generation_stream):
-                lm.rollback_speculative_cache(
-                    prompt_cache, verify_out.gdn_states, accepted_arr, bs
-                )
-
-        # --- Continuous batching: filter out finished sequences ---
-        keep_slots = [j for j in range(n_active) if not finished[active_idx[j]]]
-        if len(keep_slots) < n_active:
-            if len(keep_slots) == 0:
-                break
-            # Filter target caches (BatchKVCache supports this)
-            keep_mx = mx.array(keep_slots, dtype=mx.int32)
-            for c in prompt_cache:
-                if hasattr(c, "filter"):
-                    c.filter(keep_mx)
-            # Filter hidden
-            hidden = hidden[keep_mx]
-            # Update active index mapping
-            active_idx = [active_idx[j] for j in keep_slots]
-            # Cold-restart drafter for the new batch size
-            _reinit_drafter()
-
-        new_total = sum(emitted)
-        if new_total // 256 > total_emitted // 256:
-            mx.clear_cache()
-        total_emitted = new_total
-
-
 def generate_step(
     input_ids: mx.array,
     model: nn.Module,
@@ -1171,6 +541,7 @@ def generate_step(
         kv_quant_scheme=kv_quant_scheme,
     )
 
+    sampler_is_greedy = sampler is None and temperature == 0
     if sampler is None:
         sampler = make_sampler(
             temp=temperature,
@@ -1328,88 +699,20 @@ def generate_step(
 
     # Speculative decoding
     if draft_model is not None:
-        B = input_ids.shape[0]
-        if draft_kind == "mtp":
-            shared_kv_states = last_outputs.shared_kv_states
-            hidden = last_outputs.hidden_states[-1]
-            if B == 1:
-                mx.eval(y)
-                yield y.item(), logprobs
-                yield from _mtp_rounds(
-                    model,
-                    draft_model,
-                    prompt_cache,
-                    hidden,
-                    shared_kv_states,
-                    first_bonus=y.item(),
-                    max_tokens=max_tokens,
-                    sampler=sampler,
-                    draft_block_size=draft_block_size,
-                    token_dtype=input_ids.dtype,
-                )
-            else:
-                mx.eval(y)
-                # ``y`` is shape (B,) from sampler — no squeeze needed.
-                first_bonus = y if y.ndim == 1 else y.reshape(-1)
-                yield first_bonus.tolist(), logprobs
-                # Surface EOS token IDs from the model config so per-row
-                # stops are detected inside the round loop.
-                eos = getattr(model.config, "eos_token_id", None)
-                if isinstance(eos, int):
-                    eos_set = {eos}
-                elif eos is None:
-                    eos_set = None
-                else:
-                    eos_set = set(int(x) for x in eos)
-                yield from _mtp_rounds_batch(
-                    model,
-                    draft_model,
-                    prompt_cache,
-                    hidden,
-                    shared_kv_states,
-                    first_bonus=first_bonus,
-                    max_tokens=max_tokens,
-                    sampler=sampler,
-                    draft_block_size=draft_block_size,
-                    token_dtype=input_ids.dtype,
-                    eos_token_ids=eos_set,
-                )
-            return
-
-        if draft_kind != "dflash":
-            raise ValueError(
-                f"Unknown draft_kind {draft_kind!r}. Supported: " "['dflash', 'mtp']"
-            )
-        hidden = mx.concatenate(last_outputs.hidden_states, axis=-1)
-        if B == 1:
-            mx.eval(y)
-            yield y.item(), logprobs
-            yield from _dflash_rounds(
-                model,
-                draft_model,
-                prompt_cache,
-                hidden,
-                first_bonus=y.item(),
-                max_tokens=max_tokens,
-                sampler=sampler,
-                draft_block_size=draft_block_size,
-                token_dtype=input_ids.dtype,
-            )
-        else:
-            mx.eval(y)
-            first_bonus = y.squeeze(-1)
-            yield first_bonus.tolist(), logprobs
-            yield from _dflash_rounds_batch(
-                model,
-                draft_model,
-                prompt_cache,
-                hidden,
-                first_bonus=first_bonus,
-                max_tokens=max_tokens,
-                sampler=sampler,
-                draft_block_size=draft_block_size,
-                token_dtype=input_ids.dtype,
-            )
+        yield from run_speculative_rounds(
+            model,
+            draft_model,
+            prompt_cache,
+            input_ids,
+            y,
+            logprobs,
+            last_outputs,
+            draft_kind=draft_kind,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            draft_block_size=draft_block_size,
+            sampler_is_greedy=sampler_is_greedy,
+        )
         return
 
     n = 0
@@ -1706,8 +1009,7 @@ def stream_generate(
     total_prompt_tokens = reused_prefix_len + input_ids.size
 
     with wired_limit(model, [generation_stream]):
-        detokenizer = processor.detokenizer
-        detokenizer.reset()
+        detokenizer = make_streaming_detokenizer(processor)
         thinking_criteria = getattr(tokenizer, "thinking_budget_criteria", None)
         exact_checkpoint_len = None
         exact_checkpoint = None
@@ -1997,6 +1299,121 @@ def _right_pad_prompts(prompts, max_length=None):
     return mx.array([list(p) + [0] * (max_length - len(p)) for p in prompts])
 
 
+_SEQUENCE_ALIGNED_PROMPT_KWARGS = {
+    "attention_mask",
+    "decoder_inputs_embeds",
+    "deepstack_visual_embeds",
+    "visual_pos_masks",
+    "per_layer_inputs",
+    "full_text_row_masked_out_mask",
+    "position_ids",
+    "pos_hw",
+}
+
+APC_PRIVATE_PROMPT_KEYS = ("_apc_tenant", "_apc_image_hash")
+
+
+def _prompt_kwarg_row(v: mx.array, row_idx: int, batch_size: int) -> mx.array:
+    if v.shape[0] == batch_size:
+        return v[row_idx : row_idx + 1]
+    return v[:1]
+
+
+def _split_prompt_kwargs_per_row(prompt_kwargs: dict, batch_size: int) -> List[dict]:
+    """Normalize batched prompt kwargs into one dict per batch row.
+
+    ``model.get_input_embeddings()`` commonly returns batch-sized tensors
+    (notably ``inputs_embeds``). ``BatchGenerator.insert()`` stores prompt
+    kwargs per sequence, so passing the same batched dict for every row causes
+    the prompt builder to concatenate those batched tensors ``batch_size``
+    times, effectively squaring the batch dimension.
+    """
+    if batch_size <= 1:
+        return [prompt_kwargs or {}]
+
+    rows = [{} for _ in range(batch_size)]
+    for k, v in (prompt_kwargs or {}).items():
+        if isinstance(v, mx.array) and v.ndim > 0 and v.shape[0] >= 1:
+            for i in range(batch_size):
+                rows[i][k] = _prompt_kwarg_row(v, i, batch_size)
+        else:
+            for row in rows:
+                row[k] = v
+    return rows
+
+
+def _is_sequence_aligned_prompt_kwarg(
+    key: str, v: mx.array, sequence_length: int
+) -> bool:
+    return (
+        key in _SEQUENCE_ALIGNED_PROMPT_KWARGS
+        and v.ndim >= 2
+        and v.shape[1] == sequence_length
+    )
+
+
+def _pad_sequence_aligned_prompt_kwarg(
+    v: mx.array, target_length: int, *, left: bool
+) -> mx.array:
+    pad = target_length - v.shape[1]
+    if pad <= 0:
+        return v
+    pad_shape = (v.shape[0], pad) + tuple(v.shape[2:])
+    pad_v = mx.zeros(pad_shape, dtype=v.dtype)
+    parts = [pad_v, v] if left else [v, pad_v]
+    return mx.concatenate(parts, axis=1)
+
+
+def _merge_prefill_prompt_kwargs(
+    prompt_kwargs_list: List[Optional[dict]],
+    input_ids: List[List[int]],
+) -> Tuple[mx.array, dict]:
+    """Batch per-row prompt kwargs for a left-padded prefill forward."""
+    lengths = [len(ids) for ids in input_ids]
+    max_length = max(lengths)
+
+    row_embeds: List[mx.array] = []
+    embed_dtype = None
+    embed_dim = None
+    for kw, length in zip(prompt_kwargs_list, lengths):
+        if not kw or kw.get("inputs_embeds") is None:
+            raise ValueError("inputs_embeds is required")
+        embeds = kw["inputs_embeds"]  # [1, length, D]
+        embed_dtype = embeds.dtype
+        embed_dim = embeds.shape[-1]
+        if length < max_length:
+            pad = mx.zeros(
+                (embeds.shape[0], max_length - length, embed_dim),
+                dtype=embed_dtype,
+            )
+            embeds = mx.concatenate([pad, embeds], axis=1)
+        row_embeds.append(embeds)
+    inputs_embeds = mx.concatenate(row_embeds, axis=0)
+
+    merged_kwargs: dict = {}
+    per_row_keys: dict = {}
+    batch_size = len(prompt_kwargs_list)
+    for i, (kw, length) in enumerate(zip(prompt_kwargs_list, lengths)):
+        if not kw:
+            continue
+        for k, v in kw.items():
+            if k == "inputs_embeds" or k in APC_PRIVATE_PROMPT_KEYS:
+                continue
+            if isinstance(v, mx.array) and v.ndim > 0 and v.shape[0] >= 1:
+                row_v = _prompt_kwarg_row(v, i, batch_size)
+                if _is_sequence_aligned_prompt_kwarg(k, row_v, length):
+                    row_v = _pad_sequence_aligned_prompt_kwarg(
+                        row_v, max_length, left=True
+                    )
+                per_row_keys.setdefault(k, []).append(row_v)
+            elif k not in merged_kwargs:
+                merged_kwargs[k] = v
+    for k, vs in per_row_keys.items():
+        merged_kwargs[k] = mx.concatenate(vs, axis=0)
+
+    return inputs_embeds, merged_kwargs
+
+
 def _extend_cache(cache_a, cache_b):
     """Extend cache_a with cache_b along the batch dimension."""
     if not cache_a:
@@ -2125,6 +1542,16 @@ class BatchResponse:
     texts: List[str]
     stats: BatchStats
     image_sizes: Optional[List[Tuple[int, int]]] = None
+
+
+@dataclass
+class PromptProgress:
+    """Per-request prompt processing metrics for continuous batching."""
+
+    uid: int
+    prompt_tokens: int
+    prompt_tps: float = 0.0
+    prompt_time: float = 0.0
 
 
 class GenerationBatch:
@@ -2464,6 +1891,7 @@ class PromptProcessingBatch:
     ):
         self.model = model
         self.uids = uids
+        self._prompt_uids = list(uids)
         self.max_tokens = max_tokens
         self.prefill_step_size = prefill_step_size
 
@@ -2497,13 +1925,34 @@ class PromptProcessingBatch:
             else []
         )
         self._inputs_embeds = inputs_embeds
-        self._prompt_kwargs = prompt_kwargs
+        self._prompt_kwargs = prompt_kwargs or {}
+        self._prompt_length_aware_keys: List[str] = []
+        if self._prompt_kwargs and self._inputs_embeds is not None:
+            prompt_batch = self._inputs_embeds.shape[0]
+            prompt_len = self._inputs_embeds.shape[1]
+            for k, v in self._prompt_kwargs.items():
+                if (
+                    isinstance(v, mx.array)
+                    and v.ndim >= 2
+                    and v.shape[0] == prompt_batch
+                    and v.shape[1] == prompt_len
+                ):
+                    self._prompt_length_aware_keys.append(k)
 
         # APC metadata used for post-prefill block harvest (per-row).
         self._apc_meta = apc_meta or []
         self._apc_manager = apc_manager
         self._apc_mode = apc_mode
         self._apc_harvest_enabled = True
+        self._prompt_time_s = 0.0
+        self._prompt_tokens_per_row: List[int] = []
+        for idx, suffix_len in enumerate(lengths):
+            full_input_ids = None
+            if idx < len(self._apc_meta) and self._apc_meta[idx] is not None:
+                full_input_ids = self._apc_meta[idx].get("full_input_ids")
+            self._prompt_tokens_per_row.append(
+                len(full_input_ids) if full_input_ids is not None else suffix_len
+            )
 
         if warm_cache is not None:
             self.prompt_cache = warm_cache
@@ -2626,6 +2075,14 @@ class PromptProcessingBatch:
             )
             meta["checkpoint_done"] = True
 
+    def _prompt_kwargs_for_step(self, n: Optional[int] = None) -> dict:
+        if n is None or not self._prompt_length_aware_keys:
+            return self._prompt_kwargs
+        out = dict(self._prompt_kwargs)
+        for k in self._prompt_length_aware_keys:
+            out[k] = out[k][:, :n, ...]
+        return out
+
     def prompt_step(self) -> int:
         """Process one chunk of the prompt. Returns tokens processed."""
         if not self.needs_processing():
@@ -2638,20 +2095,41 @@ class PromptProcessingBatch:
             n = min(n, checkpoint_col - self._processed_prompt_columns)
         if n <= 0:
             return 0
+        prompt_kwargs = self._prompt_kwargs_for_step(n)
         self.model(
             self._input_ids[:, :n],
             cache=self.prompt_cache,
             inputs_embeds=self._inputs_embeds[:, :n],
             n_to_process=n,
-            **self._prompt_kwargs,
+            **prompt_kwargs,
         )
         mx.eval([c.state for c in self.prompt_cache])
         self._processed_prompt_columns += n
         self._store_apc_exact_checkpoints()
         self._inputs_embeds = self._inputs_embeds[:, n:]
         self._input_ids = self._input_ids[:, n:]
+        for k in self._prompt_length_aware_keys:
+            self._prompt_kwargs[k] = self._prompt_kwargs[k][:, n:, ...]
         mx.clear_cache()
         return n
+
+    def record_prompt_time(self, elapsed_s: float) -> None:
+        self._prompt_time_s += max(0.0, float(elapsed_s))
+
+    def prompt_progress(self) -> List[PromptProgress]:
+        if self._prompt_time_s <= 0:
+            return []
+        return [
+            PromptProgress(
+                uid=uid,
+                prompt_tokens=prompt_tokens,
+                prompt_tps=prompt_tokens / self._prompt_time_s,
+                prompt_time=self._prompt_time_s,
+            )
+            for uid, prompt_tokens in zip(
+                self._prompt_uids, self._prompt_tokens_per_row
+            )
+        ]
 
     def generate(
         self, sampler, stop_criteria, compute_logprobs=True, top_logprobs_k=0
@@ -2688,6 +2166,8 @@ class PromptProcessingBatch:
 
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         first_tokens = sampler(logprobs)
+
+        mx.async_eval(first_tokens)
 
         # Roll any right-padding into left-padding so the cache decoded by
         # GenerationBatch sees a canonical layout.
@@ -2858,7 +2338,7 @@ class BatchGenerator:
     Continuous batching with separate prompt processing and generation phases.
 
     next() returns (prompt_responses, generation_responses) where:
-    - prompt_responses is currently always [] (reserved for progress tracking)
+    - prompt_responses contains completed prompt-batch timing stats
     - generation_responses is a list of GenerationBatch.Response objects
     """
 
@@ -2940,7 +2420,7 @@ class BatchGenerator:
     # ---------------- APC integration helpers ----------------
     # Keys that are APC-only metadata; stripped from ``prompt_kwargs`` before
     # the merged kwargs are passed to the language model forward.
-    _APC_PRIVATE_KEYS = ("_apc_tenant", "_apc_image_hash")
+    _APC_PRIVATE_KEYS = APC_PRIVATE_PROMPT_KEYS
 
     def _apc_extra_hash(self, prompt_kwargs: dict) -> int:
         """Salt for the APC hash chain."""
@@ -3119,14 +2599,26 @@ class BatchGenerator:
         # in _apc_extra_hash, never forwarded to the model.
         merged_kwargs: dict = {}
         per_row_keys: dict = {}
-        for kw in prompt_kwargs_list:
+        batch_size = len(prompt_kwargs_list)
+        for i, kw in enumerate(prompt_kwargs_list):
             if not kw:
                 continue
+            full_len = len(full_ids[i])
+            prefix_len = prefix_lens[i]
+            right_pad = right_pad_per_row[i]
             for k, v in kw.items():
                 if k == "inputs_embeds" or k in self._APC_PRIVATE_KEYS:
                     continue
                 if isinstance(v, mx.array) and v.ndim > 0 and v.shape[0] >= 1:
-                    per_row_keys.setdefault(k, []).append(v[:1])
+                    row_v = _prompt_kwarg_row(v, i, batch_size)
+                    if _is_sequence_aligned_prompt_kwarg(k, row_v, full_len):
+                        row_v = row_v[:, prefix_len:, ...]
+                        row_v = _pad_sequence_aligned_prompt_kwarg(
+                            row_v,
+                            max_suffix_len,
+                            left=False,
+                        )
+                    per_row_keys.setdefault(k, []).append(row_v)
                 elif k not in merged_kwargs:
                     merged_kwargs[k] = v
         for k, vs in per_row_keys.items():
@@ -3331,6 +2823,19 @@ class BatchGenerator:
         stats.peak_memory = mx.get_peak_memory() / 1e9
         return stats
 
+    @staticmethod
+    def _record_prompt_batch_time(prompt_batch, elapsed_s: float) -> None:
+        recorder = getattr(prompt_batch, "record_prompt_time", None)
+        if callable(recorder):
+            recorder(elapsed_s)
+
+    @staticmethod
+    def _prompt_batch_progress(prompt_batch) -> List[PromptProgress]:
+        progress = getattr(prompt_batch, "prompt_progress", None)
+        if callable(progress):
+            return progress()
+        return []
+
     def _next(self, **kwargs):
         generation_responses = []
         prompt_responses = []
@@ -3350,7 +2855,9 @@ class BatchGenerator:
             if self._prompt_batch.needs_processing():
                 tic = time.perf_counter()
                 n = self._prompt_batch.prompt_step()
-                self._prompt_time_counter += time.perf_counter() - tic
+                elapsed = time.perf_counter() - tic
+                self._prompt_time_counter += elapsed
+                self._record_prompt_batch_time(self._prompt_batch, elapsed)
                 self._prompt_tokens_counter += n
                 return prompt_responses, generation_responses
 
@@ -3361,7 +2868,10 @@ class BatchGenerator:
                 compute_logprobs=self.compute_logprobs,
                 top_logprobs_k=self.top_logprobs_k,
             )
-            self._prompt_time_counter += time.perf_counter() - tic
+            elapsed = time.perf_counter() - tic
+            self._prompt_time_counter += elapsed
+            self._record_prompt_batch_time(self._prompt_batch, elapsed)
+            prompt_responses = self._prompt_batch_progress(self._prompt_batch)
             self._generation_batch.extend(gen_batch)
             self._prompt_batch = None
             mx.clear_cache()
@@ -3390,7 +2900,9 @@ class BatchGenerator:
                 if self._prompt_batch.needs_processing():
                     tic = time.perf_counter()
                     nstep = self._prompt_batch.prompt_step()
-                    self._prompt_time_counter += time.perf_counter() - tic
+                    elapsed = time.perf_counter() - tic
+                    self._prompt_time_counter += elapsed
+                    self._record_prompt_batch_time(self._prompt_batch, elapsed)
                 else:
                     tic = time.perf_counter()
                     gen_batch = self._prompt_batch.generate(
@@ -3399,7 +2911,10 @@ class BatchGenerator:
                         compute_logprobs=self.compute_logprobs,
                         top_logprobs_k=self.top_logprobs_k,
                     )
-                    self._prompt_time_counter += time.perf_counter() - tic
+                    elapsed = time.perf_counter() - tic
+                    self._prompt_time_counter += elapsed
+                    self._record_prompt_batch_time(self._prompt_batch, elapsed)
+                    prompt_responses = self._prompt_batch_progress(self._prompt_batch)
                     self._generation_batch.extend(gen_batch)
                     self._prompt_batch = None
                     mx.clear_cache()
@@ -3413,42 +2928,9 @@ class BatchGenerator:
             prompt_kwargs_list = [s[3] for s in sequences]
             logits_processors = [s[4] for s in sequences]
 
-            # Concatenate per-row inputs_embeds (left-padded to max length so
-            # all rows end at the same cache index). Other tensor kwargs get
-            # concatenated along the batch dim too; scalars take row 0.
-            lengths = [len(ids) for ids in input_ids]
-            max_length = max(lengths)
-            row_embeds: List[mx.array] = []
-            embed_dtype = None
-            embed_dim = None
-            for kw, l in zip(prompt_kwargs_list, lengths):
-                if not kw or kw.get("inputs_embeds") is None:
-                    raise ValueError("inputs_embeds is required")
-                e = kw["inputs_embeds"]  # [1, l, D]
-                embed_dtype = e.dtype
-                embed_dim = e.shape[-1]
-                if l < max_length:
-                    pad = mx.zeros(
-                        (e.shape[0], max_length - l, embed_dim), dtype=embed_dtype
-                    )
-                    e = mx.concatenate([pad, e], axis=1)  # left-pad
-                row_embeds.append(e)
-            inputs_embeds = mx.concatenate(row_embeds, axis=0)
-
-            merged_kwargs: dict = {}
-            per_row_keys: dict = {}
-            for kw in prompt_kwargs_list:
-                if not kw:
-                    continue
-                for k, v in kw.items():
-                    if k == "inputs_embeds" or k in self._APC_PRIVATE_KEYS:
-                        continue
-                    if isinstance(v, mx.array) and v.ndim > 0 and v.shape[0] >= 1:
-                        per_row_keys.setdefault(k, []).append(v[:1])
-                    elif k not in merged_kwargs:
-                        merged_kwargs[k] = v
-            for k, vs in per_row_keys.items():
-                merged_kwargs[k] = mx.concatenate(vs, axis=0)
+            inputs_embeds, merged_kwargs = _merge_prefill_prompt_kwargs(
+                prompt_kwargs_list, input_ids
+            )
 
             # APC: also harvest cold-prefill prefixes so future requests hit.
             apc_meta = self._build_apc_meta_for_cold(input_ids, prompt_kwargs_list)
@@ -3474,7 +2956,9 @@ class BatchGenerator:
             if self._prompt_batch.needs_processing():
                 tic = time.perf_counter()
                 n = self._prompt_batch.prompt_step()
-                self._prompt_time_counter += time.perf_counter() - tic
+                elapsed = time.perf_counter() - tic
+                self._prompt_time_counter += elapsed
+                self._record_prompt_batch_time(self._prompt_batch, elapsed)
             else:
                 tic = time.perf_counter()
                 gen_batch = self._prompt_batch.generate(
@@ -3483,7 +2967,10 @@ class BatchGenerator:
                     compute_logprobs=self.compute_logprobs,
                     top_logprobs_k=self.top_logprobs_k,
                 )
-                self._prompt_time_counter += time.perf_counter() - tic
+                elapsed = time.perf_counter() - tic
+                self._prompt_time_counter += elapsed
+                self._record_prompt_batch_time(self._prompt_batch, elapsed)
+                prompt_responses = self._prompt_batch_progress(self._prompt_batch)
                 self._generation_batch.extend(gen_batch)
                 self._prompt_batch = None
                 mx.clear_cache()
@@ -3772,7 +3259,7 @@ def _generate_batch(
     uids = gen.insert(
         input_ids.tolist(),
         max_tokens,
-        prompt_kwargs=[gen_kwargs] * len(input_ids),
+        prompt_kwargs=_split_prompt_kwargs_per_row(gen_kwargs, batch_size),
         logits_processors=logits_processors,
     )
     results = {uid: [] for uid in uids}
@@ -3825,8 +3312,18 @@ def main():
     if args.draft_model is not None:
         from .speculative.drafters import load_drafter
 
-        print(f"Loading drafter ({args.draft_kind}): {args.draft_model}")
-        draft_model = load_drafter(args.draft_model, kind=args.draft_kind)
+        print(f"Loading drafter ({args.draft_kind or 'auto'}): {args.draft_model}")
+        draft_model, resolved_kind = load_drafter(
+            args.draft_model, kind=args.draft_kind
+        )
+        if args.draft_kind is None:
+            print(f"  → auto-detected --draft-kind={resolved_kind!r}.")
+        elif resolved_kind != args.draft_kind:
+            print(
+                f"  → drafter requires --draft-kind={resolved_kind!r}; "
+                f"using {resolved_kind!r} instead of {args.draft_kind!r}."
+            )
+        args.draft_kind = resolved_kind
 
     prompt = args.prompt
 
@@ -3910,6 +3407,7 @@ def main():
                 prompt,
                 args.image,
                 args.audio,
+                args.video,
                 **stream_kwargs,
             ):
                 response += chunk.text
@@ -3956,12 +3454,9 @@ def main():
             print(result.text)
 
         if draft_model is not None:
-            lens = getattr(draft_model, "accept_lens", None) or []
-            if lens:
-                mean_accept = round(sum(lens) / len(lens), 2)
-                print(
-                    f"Speculative decoding: {mean_accept} accepted tokens over {len(lens)} rounds"
-                )
+            stats = format_speculative_stats(draft_model)
+            if stats is not None:
+                print(stats)
 
 
 if __name__ == "__main__":
