@@ -42,7 +42,6 @@ from .generate import (
     BatchGenerator,
     _make_cache,
     _merge_prefill_prompt_kwargs,
-    generate,
     normalize_resize_shape,
     stream_generate,
 )
@@ -316,28 +315,6 @@ class ServerMetricsStore:
             }
 
 
-def _prompt_eval_time_from_tps(
-    prompt_tokens: int, prompt_tps: Optional[float]
-) -> Optional[float]:
-    if prompt_tokens <= 0 or prompt_tps is None or prompt_tps <= 0:
-        return None
-    return prompt_tokens / prompt_tps
-
-
-def _decode_elapsed_from_metrics(
-    token_times: List[float],
-    generated_tokens: int,
-    generation_tps: Optional[float],
-) -> Optional[float]:
-    if len(token_times) >= 2:
-        elapsed = token_times[-1] - token_times[0]
-        if elapsed > 0:
-            return elapsed
-    if generated_tokens > 0 and generation_tps is not None and generation_tps > 0:
-        return generated_tokens / generation_tps
-    return None
-
-
 def _build_metrics_envelope(
     *,
     endpoint: str,
@@ -351,7 +328,6 @@ def _build_metrics_envelope(
     request_started_s: float,
     token_times: Optional[List[float]] = None,
     prompt_tps: Optional[float] = None,
-    generation_tps: Optional[float] = None,
     peak_memory_gb: Optional[float] = None,
     finish_reason: Optional[str] = None,
     image_count: int = 0,
@@ -363,15 +339,13 @@ def _build_metrics_envelope(
 ) -> dict:
     token_times = token_times or []
     ttft_s = max(0.0, token_times[0] - request_started_s) if token_times else None
-    decode_elapsed_s = _decode_elapsed_from_metrics(
-        token_times, generated_tokens, generation_tps
+    decode_tok_s = _derive_gen_tps(token_times, generated_tokens)
+    decode_elapsed_s = (
+        generated_tokens / decode_tok_s if decode_tok_s and generated_tokens > 0 else None
     )
-    decode_tok_s = None
-    if generation_tps is not None and generation_tps > 0:
-        decode_tok_s = generation_tps
-    elif decode_elapsed_s is not None and decode_elapsed_s > 0 and generated_tokens > 0:
-        decode_tok_s = generated_tokens / decode_elapsed_s
-    prompt_eval_time_s = _prompt_eval_time_from_tps(prompt_tokens, prompt_tps)
+    prompt_eval_time_s = (
+        prompt_tokens / prompt_tps if prompt_tps and prompt_tokens > 0 else None
+    )
     request_tok_s = (
         completion_tokens / request_elapsed_s if request_elapsed_s > 0 else 0.0
     )
@@ -1857,13 +1831,13 @@ class OpenAIUsage(BaseModel):
 
 
 def _derive_gen_tps(
-    token_times: List[float], output_tokens: int, fallback: Optional[float]
+    token_times: List[float], output_tokens: int
 ) -> Optional[float]:
-    """Fall back to elapsed decode time when generation_tps is missing (continuous-batching tokens don't carry it)."""
-    if fallback or output_tokens <= 0 or len(token_times) < 2:
-        return fallback
+    """Compute decode rate from consumer-side token timestamps."""
+    if output_tokens <= 0 or len(token_times) < 2:
+        return None
     elapsed = token_times[-1] - token_times[0]
-    return output_tokens / elapsed if elapsed > 0 else fallback
+    return output_tokens / elapsed if elapsed > 0 else None
 
 
 class GenerationTimings(BaseModel):
@@ -1884,24 +1858,21 @@ class GenerationTimings(BaseModel):
         cached_tokens: int,
         output_tokens: int,
         prompt_tps: Optional[float],
-        generation_tps: Optional[float],
-        token_times: Optional[List[float]] = None,
+        token_times: List[float],
     ) -> "GenerationTimings":
-        generation_tps = _derive_gen_tps(
-            token_times or [], output_tokens, generation_tps
-        )
+        generation_tps = _derive_gen_tps(token_times, output_tokens)
         prompt_n = max(0, int(prompt_tokens) - int(cached_tokens))
-        prompt_ms = (prompt_n / prompt_tps * 1000.0) if prompt_tps else 0.0
-        predicted_ms = (
-            (output_tokens / generation_tps * 1000.0) if generation_tps else 0.0
-        )
+        # Upstream prompt_tps is total_prompt / prefill_time, so prompt_s
+        # recovers the real prefill wallclock and prompt_n / prompt_s gives
+        # the effective uncached rate.
+        prompt_s = (prompt_tokens / prompt_tps) if prompt_tps else 0.0
         return cls(
             prompt_n=prompt_n,
             cache_n=int(cached_tokens),
             predicted_n=int(output_tokens),
-            prompt_ms=prompt_ms,
-            predicted_ms=predicted_ms,
-            prompt_per_second=float(prompt_tps or 0.0),
+            prompt_ms=prompt_s * 1000.0,
+            predicted_ms=(output_tokens / generation_tps * 1000.0) if generation_tps else 0.0,
+            prompt_per_second=(prompt_n / prompt_s) if prompt_s else 0.0,
             predicted_per_second=float(generation_tps or 0.0),
         )
 
@@ -2394,7 +2365,6 @@ async def responses_endpoint(request: Request):
                 metrics_finalized = False
                 token_times: List[float] = []
                 prompt_tps = None
-                generation_tps = None
                 peak_memory = 0.0
                 cached_tokens = 0
                 finish_reason = None
@@ -2514,9 +2484,6 @@ async def responses_endpoint(request: Request):
                             full_text += delta
                             token_times.append(time.perf_counter())
                             prompt_tps = getattr(chunk, "prompt_tps", prompt_tps)
-                            generation_tps = getattr(
-                                chunk, "generation_tps", generation_tps
-                            )
                             peak_memory = max(
                                 peak_memory,
                                 float(getattr(chunk, "peak_memory", 0.0) or 0.0),
@@ -2572,7 +2539,6 @@ async def responses_endpoint(request: Request):
                         request_started_s=request_start,
                         token_times=token_times,
                         prompt_tps=prompt_tps,
-                        generation_tps=generation_tps,
                         peak_memory_gb=peak_memory or None,
                         finish_reason=finish_reason,
                         image_count=len(images),
@@ -2586,8 +2552,7 @@ async def responses_endpoint(request: Request):
                         cached_tokens,
                         usage_stats["output_tokens"],
                         prompt_tps,
-                        generation_tps,
-                        token_times=token_times,
+                        token_times,
                     )
                     completed_response = base_response.model_copy(
                         update={
@@ -2661,7 +2626,6 @@ async def responses_endpoint(request: Request):
                 output_tokens = 0
                 token_times: List[float] = []
                 prompt_tps = None
-                generation_tps = None
                 peak_memory = 0.0
                 cached_tokens = 0
                 finish_reason = None
@@ -2708,32 +2672,32 @@ async def responses_endpoint(request: Request):
                         finish_reason,
                     ) = await asyncio.to_thread(_blocking_resp)
                 else:
-                    result = generate(
+                    for chunk in stream_generate(
                         model=model,
                         processor=processor,
                         prompt=formatted_prompt,
                         image=images,
-                        verbose=logger.isEnabledFor(logging.DEBUG),
                         vision_cache=model_cache.get("vision_cache"),
                         apc_manager=apc_manager,
                         **gen_args.to_generate_kwargs(),
                         **kwargs,
-                    )
-                    full_text = result.text
-                    prompt_tokens = result.prompt_tokens
-                    output_tokens = result.generation_tokens
-                    prompt_tps = getattr(result, "prompt_tps", None)
-                    generation_tps = getattr(result, "generation_tps", None)
-                    peak_memory = float(getattr(result, "peak_memory", 0.0) or 0.0)
-                    cached_tokens = int(getattr(result, "cached_tokens", 0) or 0)
+                    ):
+                        if chunk is None or not hasattr(chunk, "text"):
+                            continue
+                        full_text += chunk.text
+                        token_times.append(time.perf_counter())
+                        prompt_tokens = chunk.prompt_tokens
+                        output_tokens = chunk.generation_tokens
+                        prompt_tps = getattr(chunk, "prompt_tps", prompt_tps)
+                        peak_memory = max(
+                            peak_memory,
+                            float(getattr(chunk, "peak_memory", 0.0) or 0.0),
+                        )
+                        cached_tokens = int(getattr(chunk, "cached_tokens", 0) or 0)
                     finish_reason = "stop"
 
                 mx.clear_cache()
                 gc.collect()
-
-                generation_tps = _derive_gen_tps(
-                    token_times, output_tokens, generation_tps
-                )
 
                 reasoning, content = _split_thinking(full_text)
 
@@ -2771,8 +2735,7 @@ async def responses_endpoint(request: Request):
                         cached_tokens,
                         output_tokens,
                         prompt_tps,
-                        generation_tps,
-                        token_times=token_times,
+                        token_times,
                     ),
                 )
 
@@ -2807,7 +2770,6 @@ async def responses_endpoint(request: Request):
                     request_started_s=request_start,
                     token_times=token_times,
                     prompt_tps=prompt_tps,
-                    generation_tps=generation_tps,
                     peak_memory_gb=peak_memory or None,
                     finish_reason=finish_reason,
                     image_count=len(images),
@@ -2991,7 +2953,6 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 metrics_finalized = False
                 token_times: List[float] = []
                 prompt_tps = None
-                generation_tps = None
                 peak_memory = 0.0
                 cached_tokens = 0
                 finish_reason = None
@@ -3130,8 +3091,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                             cached_tokens,
                                             output_tokens,
                                             prompt_tps,
-                                            generation_tps,
-                                            token_times=token_times,
+                                            token_times,
                                         )
                                         if token.finish_reason
                                         else None
@@ -3178,8 +3138,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                         cached_tokens,
                                         output_tokens,
                                         prompt_tps,
-                                        generation_tps,
-                                        token_times=token_times,
+                                        token_times,
                                     ),
                                 )
                                 yield f"data: {chunk_data.model_dump_json()}\n\n"
@@ -3212,9 +3171,6 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             token_times.append(time.perf_counter())
                             output_tokens = chunk.generation_tokens
                             prompt_tps = getattr(chunk, "prompt_tps", prompt_tps)
-                            generation_tps = getattr(
-                                chunk, "generation_tps", generation_tps
-                            )
                             peak_memory = max(
                                 peak_memory,
                                 float(getattr(chunk, "peak_memory", 0.0) or 0.0),
@@ -3275,8 +3231,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 cached_tokens,
                                 output_tokens,
                                 prompt_tps,
-                                generation_tps,
-                                token_times=token_times,
+                                token_times,
                             ),
                         )
                         yield f"data: {final_chunk.model_dump_json()}\n\n"
@@ -3305,7 +3260,6 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         request_started_s=request_start,
                         token_times=token_times,
                         prompt_tps=prompt_tps,
-                        generation_tps=generation_tps,
                         peak_memory_gb=peak_memory or None,
                         finish_reason=finish_reason
                         or ("stop" if output_tokens > 0 else None),
@@ -3386,7 +3340,6 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 cached_tokens = 0
                 token_times: List[float] = []
                 prompt_tps = None
-                generation_tps = None
                 finish_reason = None
 
                 collected_logprobs: List[
@@ -3441,33 +3394,33 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         finish_reason,
                     ) = await asyncio.to_thread(_blocking_generate)
                 else:
-                    gen_result = generate(
+                    for chunk in stream_generate(
                         model=model,
                         processor=processor,
                         prompt=formatted_prompt,
                         image=images,
                         audio=audio,
-                        verbose=logger.isEnabledFor(logging.DEBUG),
                         vision_cache=model_cache.get("vision_cache"),
                         apc_manager=apc_manager,
                         **gen_args.to_generate_kwargs(),
                         **kwargs,
-                    )
-                    full_text = gen_result.text
-                    prompt_tokens = gen_result.prompt_tokens
-                    output_tokens = gen_result.generation_tokens
-                    peak_memory = float(getattr(gen_result, "peak_memory", 0.0) or 0.0)
-                    prompt_tps = getattr(gen_result, "prompt_tps", None)
-                    generation_tps = getattr(gen_result, "generation_tps", None)
-                    cached_tokens = int(getattr(gen_result, "cached_tokens", 0) or 0)
+                    ):
+                        if chunk is None or not hasattr(chunk, "text"):
+                            continue
+                        full_text += chunk.text
+                        token_times.append(time.perf_counter())
+                        prompt_tokens = chunk.prompt_tokens
+                        output_tokens = chunk.generation_tokens
+                        prompt_tps = getattr(chunk, "prompt_tps", prompt_tps)
+                        peak_memory = max(
+                            peak_memory,
+                            float(getattr(chunk, "peak_memory", 0.0) or 0.0),
+                        )
+                        cached_tokens = int(getattr(chunk, "cached_tokens", 0) or 0)
                     finish_reason = "stop"
 
                 mx.clear_cache()
                 gc.collect()
-
-                generation_tps = _derive_gen_tps(
-                    token_times, output_tokens, generation_tps
-                )
 
                 reasoning, content = _split_thinking(full_text)
 
@@ -3483,8 +3436,15 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     prompt_tokens_details=PromptTokensDetails(
                         cached_tokens=cached_tokens
                     ),
-                    prompt_tps=float(prompt_tps or 0.0),
-                    generation_tps=float(generation_tps or 0.0),
+                    # Rescale upstream prompt_tps (total/prefill_time) to uncached rate.
+                    prompt_tps=(
+                        max(0, prompt_tokens - cached_tokens) / prompt_tokens * prompt_tps
+                        if prompt_tps and prompt_tokens > 0
+                        else 0.0
+                    ),
+                    generation_tps=float(
+                        _derive_gen_tps(token_times, output_tokens) or 0.0
+                    ),
                     peak_memory=peak_memory,
                 )
 
@@ -3551,8 +3511,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         cached_tokens,
                         output_tokens,
                         prompt_tps,
-                        generation_tps,
-                        token_times=token_times,
+                        token_times,
                     ),
                 )
 
@@ -3588,7 +3547,6 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     request_started_s=request_start,
                     token_times=token_times,
                     prompt_tps=prompt_tps,
-                    generation_tps=generation_tps,
                     peak_memory_gb=peak_memory or None,
                     finish_reason=(
                         "tool_calls" if parsed_tool_calls else finish_reason or "stop"
