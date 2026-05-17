@@ -1849,7 +1849,9 @@ class OpenAIUsage(BaseModel):
     """Token usage details including input tokens, output tokens, breakdown, and total tokens used."""
 
     input_tokens: int
-    input_tokens_details: PromptTokensDetails = Field(default_factory=PromptTokensDetails)
+    input_tokens_details: PromptTokensDetails = Field(
+        default_factory=PromptTokensDetails
+    )
     output_tokens: int
     total_tokens: int
 
@@ -3223,9 +3225,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         # Terminal chunk with finish_reason + timings,
                         # mirroring the continuous-batching path.
                         finish_reason = (
-                            "length"
-                            if output_tokens >= gen_args.max_tokens
-                            else "stop"
+                            "length" if output_tokens >= gen_args.max_tokens else "stop"
                         )
                         final_chunk = ChatStreamChunk(
                             id=request_id,
@@ -3298,7 +3298,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                     elapsed = time.perf_counter() - request_start
                     logger.debug(
-                        "chat/completions stream done: tokens=%d " "total_time=%.2fs",
+                        "chat/completions stream done: tokens=%d total_time=%.2fs",
                         output_tokens,
                         elapsed,
                     )

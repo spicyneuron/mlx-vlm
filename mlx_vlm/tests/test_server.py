@@ -755,7 +755,7 @@ def test_chat_completions_streaming_emits_timings_on_finish(client, monkeypatch)
 
     assert response.status_code == 200
     chunks = [
-        json.loads(line[len("data: "):])
+        json.loads(line[len("data: ") :])
         for line in response.text.splitlines()
         if line.startswith("data: ") and line != "data: [DONE]"
     ]
