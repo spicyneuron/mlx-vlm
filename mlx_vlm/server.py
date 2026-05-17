@@ -1856,6 +1856,16 @@ class OpenAIUsage(BaseModel):
     total_tokens: int
 
 
+def _derive_gen_tps(
+    token_times: List[float], output_tokens: int, fallback: Optional[float]
+) -> Optional[float]:
+    """Fall back to elapsed decode time when generation_tps is missing (continuous-batching tokens don't carry it)."""
+    if fallback or output_tokens <= 0 or len(token_times) < 2:
+        return fallback
+    elapsed = token_times[-1] - token_times[0]
+    return output_tokens / elapsed if elapsed > 0 else fallback
+
+
 class GenerationTimings(BaseModel):
     """Per-request timing breakdown. Durations are in milliseconds."""
 
@@ -1877,12 +1887,9 @@ class GenerationTimings(BaseModel):
         generation_tps: Optional[float],
         token_times: Optional[List[float]] = None,
     ) -> "GenerationTimings":
-        # Streaming paths don't carry generation_tps on tokens; derive it from
-        # decode timestamps when available.
-        if not generation_tps and token_times and len(token_times) >= 2:
-            elapsed = token_times[-1] - token_times[0]
-            if elapsed > 0:
-                generation_tps = output_tokens / elapsed
+        generation_tps = _derive_gen_tps(
+            token_times or [], output_tokens, generation_tps
+        )
         prompt_n = max(0, int(prompt_tokens) - int(cached_tokens))
         prompt_ms = (prompt_n / prompt_tps * 1000.0) if prompt_tps else 0.0
         predicted_ms = (
@@ -2724,6 +2731,10 @@ async def responses_endpoint(request: Request):
                 mx.clear_cache()
                 gc.collect()
 
+                generation_tps = _derive_gen_tps(
+                    token_times, output_tokens, generation_tps
+                )
+
                 reasoning, content = _split_thinking(full_text)
 
                 response = OpenAIResponse(
@@ -2761,6 +2772,7 @@ async def responses_endpoint(request: Request):
                         output_tokens,
                         prompt_tps,
                         generation_tps,
+                        token_times=token_times,
                     ),
                 )
 
@@ -3453,6 +3465,10 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 mx.clear_cache()
                 gc.collect()
 
+                generation_tps = _derive_gen_tps(
+                    token_times, output_tokens, generation_tps
+                )
+
                 reasoning, content = _split_thinking(full_text)
 
                 # Count raw generated tokens minus thinking tag tokens
@@ -3536,6 +3552,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         output_tokens,
                         prompt_tps,
                         generation_tps,
+                        token_times=token_times,
                     ),
                 )
 
