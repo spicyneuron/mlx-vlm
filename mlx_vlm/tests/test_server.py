@@ -686,6 +686,13 @@ def test_generation_timings_from_metrics():
     assert t.prompt_ms == 0.0 and t.predicted_ms == 0.0
     assert t.prompt_per_second == 0.0 and t.predicted_per_second == 0.0
 
+    # Streaming paths derive generation_tps from token_times when missing.
+    t = server.GenerationTimings.from_metrics(
+        5, 0, 4, 10.0, None, token_times=[100.0, 100.5, 101.0, 101.5, 102.0]
+    )
+    assert t.predicted_per_second == pytest.approx(2.0)  # 4 tokens / 2.0s
+    assert t.predicted_ms == pytest.approx(2000.0)
+
 
 def test_chat_completions_returns_timings(client):
     config = SimpleNamespace(model_type="qwen2_vl")
