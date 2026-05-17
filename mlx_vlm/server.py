@@ -3232,6 +3232,41 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             yield f"data: {chunk_data.model_dump_json()}\n\n"
                             await asyncio.sleep(0.01)
 
+                        # Terminal chunk with finish_reason + timings,
+                        # mirroring the continuous-batching path.
+                        finish_reason = (
+                            "length"
+                            if output_tokens >= gen_args.max_tokens
+                            else "stop"
+                        )
+                        final_chunk = ChatStreamChunk(
+                            id=request_id,
+                            created=int(time.time()),
+                            model=request.model,
+                            usage={
+                                "prompt_tokens": stream_prompt_tokens,
+                                "completion_tokens": output_tokens,
+                                "total_tokens": stream_prompt_tokens + output_tokens,
+                                "prompt_tokens_details": {
+                                    "cached_tokens": cached_tokens
+                                },
+                            },
+                            choices=[
+                                ChatStreamChoice(
+                                    finish_reason=finish_reason,
+                                    delta=ChatMessage(role="assistant"),
+                                )
+                            ],
+                            timings=_make_timings(
+                                stream_prompt_tokens,
+                                cached_tokens,
+                                output_tokens,
+                                prompt_tps,
+                                generation_tps,
+                            ),
+                        )
+                        yield f"data: {final_chunk.model_dump_json()}\n\n"
+
                     metrics_text = full_output or output_text
                     completion_tokens = max(
                         0, output_tokens - _count_thinking_tag_tokens(metrics_text)
