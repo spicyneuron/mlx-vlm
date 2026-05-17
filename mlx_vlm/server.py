@@ -1875,7 +1875,14 @@ class GenerationTimings(BaseModel):
         output_tokens: int,
         prompt_tps: Optional[float],
         generation_tps: Optional[float],
+        token_times: Optional[List[float]] = None,
     ) -> "GenerationTimings":
+        # Streaming paths don't carry generation_tps on tokens; derive it from
+        # decode timestamps when available.
+        if not generation_tps and token_times and len(token_times) >= 2:
+            elapsed = token_times[-1] - token_times[0]
+            if elapsed > 0:
+                generation_tps = output_tokens / elapsed
         prompt_n = max(0, int(prompt_tokens) - int(cached_tokens))
         prompt_ms = (prompt_n / prompt_tps * 1000.0) if prompt_tps else 0.0
         predicted_ms = (
@@ -2573,6 +2580,7 @@ async def responses_endpoint(request: Request):
                         usage_stats["output_tokens"],
                         prompt_tps,
                         generation_tps,
+                        token_times=token_times,
                     )
                     completed_response = base_response.model_copy(
                         update={
@@ -3111,6 +3119,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                             output_tokens,
                                             prompt_tps,
                                             generation_tps,
+                                            token_times=token_times,
                                         )
                                         if token.finish_reason
                                         else None
@@ -3158,6 +3167,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                         output_tokens,
                                         prompt_tps,
                                         generation_tps,
+                                        token_times=token_times,
                                     ),
                                 )
                                 yield f"data: {chunk_data.model_dump_json()}\n\n"
@@ -3254,6 +3264,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 output_tokens,
                                 prompt_tps,
                                 generation_tps,
+                                token_times=token_times,
                             ),
                         )
                         yield f"data: {final_chunk.model_dump_json()}\n\n"
