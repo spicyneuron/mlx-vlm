@@ -1857,7 +1857,7 @@ class OpenAIUsage(BaseModel):
 
 
 class GenerationTimings(BaseModel):
-    """llama.cpp-style timing breakdown. Durations are in milliseconds."""
+    """Per-request timing breakdown. Durations are in milliseconds."""
 
     prompt_n: int
     cache_n: int
@@ -1867,26 +1867,29 @@ class GenerationTimings(BaseModel):
     prompt_per_second: float
     predicted_per_second: float
 
-
-def _make_timings(
-    prompt_tokens: int,
-    cached_tokens: int,
-    output_tokens: int,
-    prompt_tps: Optional[float],
-    generation_tps: Optional[float],
-) -> GenerationTimings:
-    prompt_n = max(0, int(prompt_tokens) - int(cached_tokens))
-    prompt_ms = (prompt_n / prompt_tps * 1000.0) if prompt_tps else 0.0
-    predicted_ms = (output_tokens / generation_tps * 1000.0) if generation_tps else 0.0
-    return GenerationTimings(
-        prompt_n=prompt_n,
-        cache_n=int(cached_tokens),
-        predicted_n=int(output_tokens),
-        prompt_ms=prompt_ms,
-        predicted_ms=predicted_ms,
-        prompt_per_second=float(prompt_tps or 0.0),
-        predicted_per_second=float(generation_tps or 0.0),
-    )
+    @classmethod
+    def from_metrics(
+        cls,
+        prompt_tokens: int,
+        cached_tokens: int,
+        output_tokens: int,
+        prompt_tps: Optional[float],
+        generation_tps: Optional[float],
+    ) -> "GenerationTimings":
+        prompt_n = max(0, int(prompt_tokens) - int(cached_tokens))
+        prompt_ms = (prompt_n / prompt_tps * 1000.0) if prompt_tps else 0.0
+        predicted_ms = (
+            (output_tokens / generation_tps * 1000.0) if generation_tps else 0.0
+        )
+        return cls(
+            prompt_n=prompt_n,
+            cache_n=int(cached_tokens),
+            predicted_n=int(output_tokens),
+            prompt_ms=prompt_ms,
+            predicted_ms=predicted_ms,
+            prompt_per_second=float(prompt_tps or 0.0),
+            predicted_per_second=float(generation_tps or 0.0),
+        )
 
 
 class OpenAIErrorObject(BaseModel):
@@ -1942,7 +1945,7 @@ class OpenAIResponse(BaseModel):
         ..., description="Token usage details"
     )  # we need the model to return stats
     timings: Optional[GenerationTimings] = Field(
-        None, description="llama.cpp-style timing breakdown"
+        None, description="Per-request timing breakdown"
     )
     user: Optional[str] = Field(
         None, description="A unique identifier representing your end-user"
@@ -2564,7 +2567,7 @@ async def responses_endpoint(request: Request):
                     )
                     server_metrics.record_success(envelope)
                     metrics_finalized = True
-                    timings = _make_timings(
+                    timings = GenerationTimings.from_metrics(
                         usage_stats["input_tokens"],
                         cached_tokens,
                         usage_stats["output_tokens"],
@@ -2744,7 +2747,7 @@ async def responses_endpoint(request: Request):
                         "output_tokens": output_tokens,
                         "total_tokens": prompt_tokens + output_tokens,
                     },
-                    timings=_make_timings(
+                    timings=GenerationTimings.from_metrics(
                         prompt_tokens,
                         cached_tokens,
                         output_tokens,
@@ -3102,7 +3105,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                     },
                                     choices=choices,
                                     timings=(
-                                        _make_timings(
+                                        GenerationTimings.from_metrics(
                                             ctx.prompt_tokens,
                                             cached_tokens,
                                             output_tokens,
@@ -3149,7 +3152,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                         },
                                     },
                                     choices=choices,
-                                    timings=_make_timings(
+                                    timings=GenerationTimings.from_metrics(
                                         ctx.prompt_tokens,
                                         cached_tokens,
                                         output_tokens,
@@ -3245,7 +3248,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                     delta=ChatMessage(role="assistant"),
                                 )
                             ],
-                            timings=_make_timings(
+                            timings=GenerationTimings.from_metrics(
                                 stream_prompt_tokens,
                                 cached_tokens,
                                 output_tokens,
@@ -3516,7 +3519,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     model=request.model,
                     usage=usage_stats,
                     choices=choices,
-                    timings=_make_timings(
+                    timings=GenerationTimings.from_metrics(
                         prompt_tokens,
                         cached_tokens,
                         output_tokens,

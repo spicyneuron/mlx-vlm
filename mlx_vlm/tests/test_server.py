@@ -658,9 +658,36 @@ def test_chat_completions_streaming_forwards_explicit_sampling_args(
     assert captured["args"].logit_bias == {12: -1.5}
 
 
-def test_chat_completions_returns_llamacpp_timings(client):
-    model = SimpleNamespace()
-    processor = SimpleNamespace()
+def test_generation_timings_from_metrics():
+    # Common case: cached prefix reduces prompt_n; durations derived from tps.
+    t = server.GenerationTimings.from_metrics(
+        prompt_tokens=10,
+        cached_tokens=2,
+        output_tokens=4,
+        prompt_tps=20.0,
+        generation_tps=8.0,
+    )
+    assert (t.prompt_n, t.cache_n, t.predicted_n) == (8, 2, 4)
+    assert t.prompt_ms == pytest.approx(8 / 20.0 * 1000.0)
+    assert t.predicted_ms == pytest.approx(4 / 8.0 * 1000.0)
+    assert t.prompt_per_second == pytest.approx(20.0)
+    assert t.predicted_per_second == pytest.approx(8.0)
+
+    # No cache hit.
+    t = server.GenerationTimings.from_metrics(5, 0, 3, 10.0, 5.0)
+    assert t.prompt_n == 5 and t.cache_n == 0
+
+    # cached >= prompt would underflow without the guard.
+    t = server.GenerationTimings.from_metrics(4, 9, 1, 10.0, 5.0)
+    assert t.prompt_n == 0
+
+    # Missing/zero tps must not divide by zero.
+    t = server.GenerationTimings.from_metrics(5, 0, 3, None, 0.0)
+    assert t.prompt_ms == 0.0 and t.predicted_ms == 0.0
+    assert t.prompt_per_second == 0.0 and t.predicted_per_second == 0.0
+
+
+def test_chat_completions_returns_timings(client):
     config = SimpleNamespace(model_type="qwen2_vl")
     result = SimpleNamespace(
         text="done",
@@ -675,7 +702,9 @@ def test_chat_completions_returns_llamacpp_timings(client):
 
     with (
         patch.object(
-            server, "get_cached_model", return_value=(model, processor, config)
+            server,
+            "get_cached_model",
+            return_value=(SimpleNamespace(), SimpleNamespace(), config),
         ),
         patch.object(server, "apply_chat_template", return_value="prompt"),
         patch.object(server, "generate", return_value=result),
@@ -691,21 +720,13 @@ def test_chat_completions_returns_llamacpp_timings(client):
 
     assert response.status_code == 200
     body = response.json()
-    timings = body["timings"]
-    # 10 prompt tokens, 2 cached → 8 actually evaluated.
-    assert timings["prompt_n"] == 8
-    assert timings["cache_n"] == 2
-    assert timings["predicted_n"] == 4
-    assert timings["prompt_per_second"] == pytest.approx(20.0)
-    assert timings["predicted_per_second"] == pytest.approx(8.0)
-    assert timings["prompt_ms"] == pytest.approx(8 / 20.0 * 1000.0)
-    assert timings["predicted_ms"] == pytest.approx(4 / 8.0 * 1000.0)
+    # Endpoint wiring: cached_tokens flows from result → usage + timings.
     assert body["usage"]["prompt_tokens_details"]["cached_tokens"] == 2
+    assert body["timings"]["cache_n"] == 2
+    assert body["timings"]["prompt_n"] == 8
 
 
 def test_chat_completions_streaming_emits_timings_on_finish(client, monkeypatch):
-    model = SimpleNamespace()
-    processor = SimpleNamespace()
     config = SimpleNamespace(model_type="qwen2_vl")
 
     class FakeResponseGenerator:
@@ -740,7 +761,9 @@ def test_chat_completions_streaming_emits_timings_on_finish(client, monkeypatch)
 
     with (
         patch.object(
-            server, "get_cached_model", return_value=(model, processor, config)
+            server,
+            "get_cached_model",
+            return_value=(SimpleNamespace(), SimpleNamespace(), config),
         ),
         patch.object(server, "apply_chat_template", return_value="prompt"),
     ):
@@ -764,20 +787,8 @@ def test_chat_completions_streaming_emits_timings_on_finish(client, monkeypatch)
     assert len(with_timings) == 1
     final = with_timings[0]
     assert final["choices"][0]["finish_reason"] == "stop"
-    timings = final["timings"]
-    assert set(timings) == {
-        "prompt_n",
-        "cache_n",
-        "predicted_n",
-        "prompt_ms",
-        "predicted_ms",
-        "prompt_per_second",
-        "predicted_per_second",
-    }
-    assert timings["prompt_n"] == 8  # 10 prompt - 2 cached
-    assert timings["cache_n"] == 2
-    assert timings["predicted_n"] == 2
-    assert timings["prompt_per_second"] == pytest.approx(20.0)
+    # cached_tokens flows from StreamingToken → usage + timings on the terminal chunk.
+    assert final["timings"]["cache_n"] == 2
     assert final["usage"]["prompt_tokens_details"]["cached_tokens"] == 2
 
 
