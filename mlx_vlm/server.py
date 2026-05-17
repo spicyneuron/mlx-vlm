@@ -2466,13 +2466,9 @@ async def responses_endpoint(request: Request):
                             processor=processor,
                             prompt=formatted_prompt,
                             image=images,
-                            temperature=openai_request.temperature,
-                            max_tokens=gen_args.max_tokens,
-                            top_p=openai_request.top_p,
                             vision_cache=model_cache.get("vision_cache"),
-                            logits_processors=gen_args.logits_processors,
                             apc_manager=apc_manager,
-                            apc_tenant=gen_args.tenant_id,
+                            **gen_args.to_generate_kwargs(),
                             **kwargs,
                         )
 
@@ -3150,13 +3146,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             prompt=formatted_prompt,
                             image=images,
                             audio=audio,
-                            temperature=request.temperature,
-                            max_tokens=gen_args.max_tokens,
-                            top_p=request.top_p,
                             vision_cache=model_cache.get("vision_cache"),
-                            logits_processors=gen_args.logits_processors,
                             apc_manager=apc_manager,
-                            apc_tenant=gen_args.tenant_id,
+                            **gen_args.to_generate_kwargs(),
                             **kwargs,
                         )
 
