@@ -1841,7 +1841,7 @@ class OpenAIRequest(FlexibleBaseModel):
     )
 
 
-class InputTokensDetails(BaseModel):
+class PromptTokensDetails(BaseModel):
     cached_tokens: int = 0
 
 
@@ -1849,7 +1849,7 @@ class OpenAIUsage(BaseModel):
     """Token usage details including input tokens, output tokens, breakdown, and total tokens used."""
 
     input_tokens: int
-    input_tokens_details: InputTokensDetails = Field(default_factory=InputTokensDetails)
+    input_tokens_details: PromptTokensDetails = Field(default_factory=PromptTokensDetails)
     output_tokens: int
     total_tokens: int
 
@@ -2105,10 +2105,6 @@ class GenerationRequest(VLMRequest):
     stream: bool = Field(
         False, description="Whether to stream the response chunk by chunk."
     )
-
-
-class PromptTokensDetails(BaseModel):
-    cached_tokens: int = 0
 
 
 class UsageStats(BaseModel):
@@ -2462,9 +2458,7 @@ async def responses_endpoint(request: Request):
                                 float(getattr(token, "peak_memory", 0.0) or 0.0),
                             )
                             prompt_tps = getattr(token, "prompt_tps", prompt_tps)
-                            cached_tokens = (
-                                getattr(token, "cached_tokens", 0) or cached_tokens
-                            )
+                            cached_tokens = token.cached_tokens
                             usage_stats = {
                                 "input_tokens": ctx.prompt_tokens,
                                 "output_tokens": output_tokens,
@@ -2508,9 +2502,7 @@ async def responses_endpoint(request: Request):
                                 peak_memory,
                                 float(getattr(chunk, "peak_memory", 0.0) or 0.0),
                             )
-                            cached_tokens = (
-                                getattr(chunk, "cached_tokens", 0) or cached_tokens
-                            )
+                            cached_tokens = getattr(chunk, "cached_tokens", 0)
                             usage_stats = {
                                 "input_tokens": chunk.prompt_tokens,
                                 "output_tokens": chunk.generation_tokens,
@@ -2675,7 +2667,7 @@ async def responses_endpoint(request: Request):
                             tt.append(time.perf_counter())
                             ptps = getattr(tok, "prompt_tps", ptps)
                             pm = max(pm, float(getattr(tok, "peak_memory", 0.0) or 0.0))
-                            ct = getattr(tok, "cached_tokens", 0) or ct
+                            ct = tok.cached_tokens
                             if tok.finish_reason:
                                 fr = tok.finish_reason
                                 break
@@ -3026,9 +3018,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 float(getattr(token, "peak_memory", 0.0) or 0.0),
                             )
                             prompt_tps = getattr(token, "prompt_tps", prompt_tps)
-                            cached_tokens = (
-                                getattr(token, "cached_tokens", 0) or cached_tokens
-                            )
+                            cached_tokens = token.cached_tokens
 
                             # Detect thinking boundaries
                             delta_reasoning = None
@@ -3202,9 +3192,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 peak_memory,
                                 float(getattr(chunk, "peak_memory", 0.0) or 0.0),
                             )
-                            cached_tokens = (
-                                getattr(chunk, "cached_tokens", 0) or cached_tokens
-                            )
+                            cached_tokens = getattr(chunk, "cached_tokens", 0)
 
                             choices = [
                                 ChatStreamChoice(
@@ -3402,7 +3390,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             tt.append(time.perf_counter())
                             ptps = getattr(token, "prompt_tps", ptps)
                             pm = token.peak_memory
-                            ct = getattr(token, "cached_tokens", 0) or ct
+                            ct = token.cached_tokens
                             if request.logprobs and token.finish_reason != "stop":
                                 collected_logprobs.append(
                                     (token.token, token.logprobs, token.top_logprobs)
