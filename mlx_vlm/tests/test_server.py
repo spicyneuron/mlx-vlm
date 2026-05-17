@@ -1,3 +1,4 @@
+import json
 import time
 from queue import Queue
 from threading import Event, Lock, Thread
@@ -655,6 +656,129 @@ def test_chat_completions_streaming_forwards_explicit_sampling_args(
     assert captured["args"].min_p == 0.08
     assert captured["args"].repetition_penalty == 1.15
     assert captured["args"].logit_bias == {12: -1.5}
+
+
+def test_chat_completions_returns_llamacpp_timings(client):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = SimpleNamespace(
+        text="done",
+        prompt_tokens=10,
+        generation_tokens=4,
+        total_tokens=14,
+        prompt_tps=20.0,
+        generation_tps=8.0,
+        peak_memory=0.1,
+        cached_tokens=2,
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 12,
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    timings = body["timings"]
+    # 10 prompt tokens, 2 cached → 8 actually evaluated.
+    assert timings["prompt_n"] == 8
+    assert timings["cache_n"] == 2
+    assert timings["predicted_n"] == 4
+    assert timings["prompt_per_second"] == pytest.approx(20.0)
+    assert timings["predicted_per_second"] == pytest.approx(8.0)
+    assert timings["prompt_ms"] == pytest.approx(8 / 20.0 * 1000.0)
+    assert timings["predicted_ms"] == pytest.approx(4 / 8.0 * 1000.0)
+    assert body["usage"]["prompt_tokens_details"]["cached_tokens"] == 2
+
+
+def test_chat_completions_streaming_emits_timings_on_finish(client, monkeypatch):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+
+    class FakeResponseGenerator:
+        tokenizer = SimpleNamespace(decode=lambda tokens: "")
+
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
+            return None
+
+        def generate(self, prompt, images=None, audio=None, args=None):
+            return server.GenerationContext(uid=1, prompt_tokens=10), iter(
+                [
+                    server.StreamingToken(
+                        text="hi",
+                        token=1,
+                        logprobs=0.0,
+                        finish_reason=None,
+                        prompt_tps=20.0,
+                        cached_tokens=2,
+                    ),
+                    server.StreamingToken(
+                        text="!",
+                        token=2,
+                        logprobs=0.0,
+                        finish_reason="stop",
+                        prompt_tps=20.0,
+                        cached_tokens=2,
+                    ),
+                ]
+            )
+
+    monkeypatch.setattr(server, "response_generator", FakeResponseGenerator())
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True,
+            },
+        )
+
+    assert response.status_code == 200
+    chunks = [
+        json.loads(line[len("data: "):])
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    with_timings = [c for c in chunks if c.get("timings") is not None]
+    # Timings ride only on the terminal chunk.
+    assert len(with_timings) == 1
+    final = with_timings[0]
+    assert final["choices"][0]["finish_reason"] == "stop"
+    timings = final["timings"]
+    assert set(timings) == {
+        "prompt_n",
+        "cache_n",
+        "predicted_n",
+        "prompt_ms",
+        "predicted_ms",
+        "prompt_per_second",
+        "predicted_per_second",
+    }
+    assert timings["prompt_n"] == 8  # 10 prompt - 2 cached
+    assert timings["cache_n"] == 2
+    assert timings["predicted_n"] == 2
+    assert timings["prompt_per_second"] == pytest.approx(20.0)
+    assert final["usage"]["prompt_tokens_details"]["cached_tokens"] == 2
 
 
 def test_chat_completions_endpoint_flattens_text_content_parts(client):
