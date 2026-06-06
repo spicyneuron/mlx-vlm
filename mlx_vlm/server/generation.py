@@ -4,14 +4,15 @@ import os
 import time
 import traceback
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from queue import Empty as QueueEmpty
 from queue import Queue
 from threading import Event, Lock, Thread
-from typing import Callable, Iterator, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import mlx.core as mx
 from fastapi import HTTPException
+from mlx_lm.sample_utils import make_logits_processors
 
 from .. import apc as _apc
 from ..generate import (
@@ -20,7 +21,11 @@ from ..generate import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_PREFILL_STEP_SIZE,
     DEFAULT_QUANTIZED_KV_START,
+    DEFAULT_REPETITION_CONTEXT_SIZE,
+    DEFAULT_SEED,
     DEFAULT_TEMPERATURE,
+    DEFAULT_THINKING_END_TOKEN,
+    DEFAULT_THINKING_START_TOKEN,
     DEFAULT_TOP_P,
     BatchGenerator,
     _make_cache,
@@ -33,8 +38,9 @@ from ..speculative.utils import (
     speculative_hidden_state,
     speculative_prefill_kwargs,
 )
+from ..structured import ThinkingAwareLogitsProcessor
 from ..tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
-from ..utils import load, prepare_inputs
+from ..utils import ThinkingBudgetCriteria, load, prepare_inputs
 from .runtime import runtime
 
 logger = logging.getLogger("mlx_vlm.server")
@@ -53,6 +59,15 @@ class PromptTooLongError(ValueError):
 def _get_draft_block_size_from_env():
     draft_block_size_str = os.environ.get("MLX_VLM_DRAFT_BLOCK_SIZE")
     return int(draft_block_size_str) if draft_block_size_str else None
+
+
+def _notify_queues(queues, *items):
+    for queue in queues:
+        for item in items:
+            try:
+                queue.put(item)
+            except Exception:
+                break
 
 
 def get_prefill_step_size():
@@ -89,6 +104,86 @@ def get_speculative_batch_coalesce_s():
         return max(0.0, float(raw)) / 1000.0
     except ValueError:
         return DEFAULT_SPECULATIVE_BATCH_COALESCE_MS / 1000.0
+
+
+def _position_seed(seed: int, row_id: int, position: int) -> int:
+    x = (int(seed) ^ 0x9E3779B9) & 0xFFFFFFFF
+    x = (x + (int(row_id) + 1) * 0x85EBCA6B) & 0xFFFFFFFF
+    x = (x ^ ((int(position) + 1) * 0xC2B2AE35)) & 0xFFFFFFFF
+    x ^= x >> 16
+    x = (x * 0x7FEB352D) & 0xFFFFFFFF
+    x ^= x >> 15
+    return int(x & 0xFFFFFFFF)
+
+
+def _position_keys(seed: int, row_ids: List[int], positions: List[int]) -> mx.array:
+    return mx.stack(
+        [
+            mx.random.key(_position_seed(seed, row, pos))
+            for row, pos in zip(row_ids, positions)
+        ]
+    )
+
+
+class _PositionedTargetSampler:
+    """Server sampler with stateless target draws for ragged verification."""
+
+    def __init__(self, *, temperature: float, top_p: float, seed: Optional[int]):
+        self.temperature = float(temperature)
+        self.top_p = float(top_p)
+        self.seed = DEFAULT_SEED if seed is None else int(seed)
+
+    def __call__(self, logprobs: mx.array) -> mx.array:
+        if self.top_p > 0 and self.top_p < 1.0:
+            return top_p_sampling(logprobs, self.top_p, self.temperature)
+        return mx.random.categorical(logprobs * (1 / self.temperature))
+
+    def sample_target(
+        self,
+        logprobs: mx.array,
+        *,
+        row_ids: List[int],
+        positions: List[int],
+    ) -> mx.array:
+        if logprobs.shape[0] != len(row_ids) or len(row_ids) != len(positions):
+            raise ValueError("row_ids and positions must match logprobs batch size.")
+        keys = _position_keys(self.seed, row_ids, positions)
+        if self.top_p > 0 and self.top_p < 1.0:
+            return mx.vmap(self._sample_top_p_one, in_axes=(0, 0))(logprobs, keys)
+        return mx.vmap(self._sample_one, in_axes=(0, 0))(logprobs, keys)
+
+    def _sample_one(self, logprobs: mx.array, key: mx.array) -> mx.array:
+        return mx.random.categorical(logprobs * (1 / self.temperature), key=key)
+
+    def _sample_top_p_one(self, logprobs: mx.array, key: mx.array) -> mx.array:
+        if logprobs.dtype == mx.bfloat16:
+            logprobs = logprobs.astype(mx.float32)
+        probs = mx.softmax(logprobs / self.temperature, axis=-1)
+        sorted_indices = mx.argsort(probs, axis=-1)
+        sorted_probs = mx.take_along_axis(probs, sorted_indices, axis=-1)
+        cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
+        top_probs = mx.where(
+            cumulative_probs > 1 - self.top_p,
+            sorted_probs,
+            mx.zeros_like(sorted_probs),
+        )
+        sampled_pos = mx.random.categorical(mx.log(top_probs), key=key)
+        return mx.take_along_axis(sorted_indices, sampled_pos[..., None], axis=-1)[0]
+
+
+def _sample_last_token(
+    logits: mx.array,
+    sampler: Callable[[mx.array], mx.array],
+    *,
+    row_ids: Optional[List[int]] = None,
+    positions: Optional[List[int]] = None,
+):
+    logits = logits[:, -1, :]
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    sample_target = getattr(sampler, "sample_target", None)
+    if callable(sample_target) and row_ids is not None and positions is not None:
+        return sample_target(logprobs, row_ids=row_ids, positions=positions)
+    return sampler(logprobs)
 
 
 def get_server_enable_thinking():
@@ -425,11 +520,18 @@ class GenerationArguments:
     top_k: int = 0
     min_p: float = 0.0
     seed: Optional[int] = None
+    logprobs: bool = False
     repetition_penalty: Optional[float] = None
+    repetition_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE
+    presence_penalty: Optional[float] = None
+    presence_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE
+    frequency_penalty: Optional[float] = None
+    frequency_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE
     logit_bias: Optional[dict] = None
     enable_thinking: bool = DEFAULT_ENABLE_THINKING
     thinking_budget: Optional[int] = None
     thinking_start_token: Optional[str] = None
+    thinking_end_token: Optional[str] = None
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None
     # Per-tenant salt for APC. When set, it's mixed into ``extra_hash`` so
     # cached blocks from one tenant can't be reused (or detected via timing)
@@ -446,14 +548,28 @@ class GenerationArguments:
             "min_p": self.min_p,
             "enable_thinking": self.enable_thinking,
         }
+        if self.seed is not None:
+            kw["seed"] = self.seed
         if self.repetition_penalty is not None:
             kw["repetition_penalty"] = self.repetition_penalty
+        if self.repetition_context_size is not None:
+            kw["repetition_context_size"] = self.repetition_context_size
+        if self.presence_penalty is not None:
+            kw["presence_penalty"] = self.presence_penalty
+        if self.presence_context_size is not None:
+            kw["presence_context_size"] = self.presence_context_size
+        if self.frequency_penalty is not None:
+            kw["frequency_penalty"] = self.frequency_penalty
+        if self.frequency_context_size is not None:
+            kw["frequency_context_size"] = self.frequency_context_size
         if self.logit_bias is not None:
             kw["logit_bias"] = self.logit_bias
         if self.thinking_budget is not None:
             kw["thinking_budget"] = self.thinking_budget
         if self.thinking_start_token is not None:
             kw["thinking_start_token"] = self.thinking_start_token
+        if self.thinking_end_token is not None:
+            kw["thinking_end_token"] = self.thinking_end_token
         if self.logits_processors is not None:
             kw["logits_processors"] = self.logits_processors
         if self.tenant_id is not None:
@@ -467,6 +583,8 @@ class GenerationArguments:
             kw["thinking_budget"] = self.thinking_budget
         if self.thinking_start_token is not None:
             kw["thinking_start_token"] = self.thinking_start_token
+        if self.thinking_end_token is not None:
+            kw["thinking_end_token"] = self.thinking_end_token
         return kw
 
 
@@ -476,6 +594,35 @@ class GenerationContext:
 
     uid: int
     prompt_tokens: int
+
+
+@dataclass
+class GenerationMetrics:
+    """Runtime metrics collected while consuming generation output."""
+
+    token_times: List[float] = field(default_factory=list)
+    peak_memory: float = 0.0
+    cached_tokens: int = 0
+    prompt_tps: Optional[float] = None
+    generation_tps: Optional[float] = None
+
+    def record_chunk(self, chunk) -> None:
+        self.token_times.append(time.perf_counter())
+        self.record_result(chunk)
+
+    def record_result(self, result) -> None:
+        self.peak_memory = max(
+            self.peak_memory, float(getattr(result, "peak_memory", 0.0) or 0.0)
+        )
+        prompt_tps = getattr(result, "prompt_tps", None)
+        if prompt_tps is not None:
+            self.prompt_tps = prompt_tps
+        generation_tps = getattr(result, "generation_tps", None)
+        if generation_tps is not None:
+            self.generation_tps = generation_tps
+        cached_tokens = getattr(result, "cached_tokens", None)
+        if cached_tokens is not None:
+            self.cached_tokens = max(self.cached_tokens, int(cached_tokens))
 
 
 @dataclass
@@ -489,6 +636,71 @@ class StreamingToken:
     peak_memory: float = 0.0
     prompt_tps: Optional[float] = None
     top_logprobs: Optional[List[Tuple[int, float]]] = None
+    cached_tokens: int = 0
+
+
+class _TokenIterator:
+    """Closeable iterator over queued tokens for one generation request.
+
+    close() cancels unfinished requests and is safe while another thread is
+    blocked in __next__ waiting for the next token.
+    """
+
+    def __init__(self, rqueue, uid, cancel_fn, queue_timeout):
+        self._rqueue = rqueue
+        self._uid = uid
+        self._cancel_fn = cancel_fn
+        self._queue_timeout = queue_timeout
+        self._ended = False
+        self._closed = False
+        self._lock = Lock()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._ended:
+            raise StopIteration
+        try:
+            item = self._rqueue.get(timeout=self._queue_timeout)
+        except QueueEmpty as exc:
+            # Consumer is stalled or upstream is wedged — treat as cancel.
+            self.close()
+            label = (
+                "without a timeout"
+                if self._queue_timeout is None
+                else f"for {self._queue_timeout:g}s"
+            )
+            raise RuntimeError(
+                "Timed out waiting "
+                f"{label} for the next generated token. "
+                "Increase MLX_VLM_TOKEN_QUEUE_TIMEOUT for long "
+                "prefills, or reduce the prompt size."
+            ) from exc
+        if item is None:
+            self._ended = True
+            raise StopIteration
+        if isinstance(item, Exception):
+            self._ended = True
+            raise item
+        if getattr(item, "finish_reason", None):
+            self._ended = True
+        return item
+
+    def close(self):
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        if not self._ended:
+            self._cancel_fn(self._uid)
+
+    def __del__(self):
+        # Mirror generator semantics: implicit close on GC.
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 class ResponseGenerator:
@@ -574,7 +786,10 @@ class ResponseGenerator:
         draft_kind = os.environ.get("MLX_VLM_DRAFT_KIND")
         draft_model_path = os.environ.get("MLX_VLM_DRAFT_MODEL")
         if draft_model_path:
-            from ..speculative.drafters import load_drafter
+            from ..speculative.drafters import (
+                load_drafter,
+                validate_drafter_compatibility,
+            )
 
             print(
                 f"Loading speculative drafter ({draft_kind or 'auto'}): "
@@ -589,7 +804,17 @@ class ResponseGenerator:
                     f"using {resolved_kind!r} instead of {draft_kind!r}."
                 )
             draft_kind = resolved_kind
-            print("Drafter ready — speculative decoding enabled.")
+            try:
+                validate_drafter_compatibility(model, draft_model, draft_kind)
+            except ValueError as e:
+                print(
+                    "Speculative drafter is incompatible with the target model; "
+                    f"falling back to autoregressive generation. {e}"
+                )
+                draft_model = None
+                draft_kind = None
+            else:
+                print("Drafter ready — speculative decoding enabled.")
 
         self.model = model
         self.processor = processor
@@ -607,12 +832,16 @@ class ResponseGenerator:
         images: Optional[List] = None,
         audio: Optional[List] = None,
         args: Optional[GenerationArguments] = None,
-    ) -> Tuple[GenerationContext, Iterator[StreamingToken]]:
+    ) -> Tuple[GenerationContext, "_TokenIterator"]:
         self.wait_until_ready()
         args = args or GenerationArguments(max_tokens=get_server_max_tokens())
         if self.draft_model is not None and args.logits_processors is not None:
             raise ValueError(
                 "Structured response_format is not supported with speculative decoding."
+            )
+        if self.draft_model is not None and args.thinking_budget is not None:
+            raise ValueError(
+                "thinking_budget is not supported with speculative decoding in the server."
             )
         rqueue: Queue = Queue()
 
@@ -629,52 +858,16 @@ class ResponseGenerator:
         if isinstance(ctx, Exception):
             raise ctx
 
-        uid = ctx.uid
-
-        def token_iterator():
-            # Mark ended before yielding the final token so a consumer that
-            # closes immediately after seeing finish_reason isn't treated
-            # as a client abort.
-            ended = False
-            queue_timeout = get_token_queue_timeout()
-            try:
-                while True:
-                    try:
-                        item = rqueue.get(timeout=queue_timeout)
-                    except QueueEmpty as exc:
-                        timeout_label = (
-                            "without a timeout"
-                            if queue_timeout is None
-                            else f"for {queue_timeout:g}s"
-                        )
-                        raise RuntimeError(
-                            "Timed out waiting "
-                            f"{timeout_label} for the next generated token. "
-                            "Increase MLX_VLM_TOKEN_QUEUE_TIMEOUT for long "
-                            "prefills, or reduce the prompt size."
-                        ) from exc
-                    if item is None:
-                        ended = True
-                        break
-                    if isinstance(item, Exception):
-                        ended = True
-                        raise item
-                    if getattr(item, "finish_reason", None):
-                        ended = True
-                    yield item
-                    if ended:
-                        break
-            finally:
-                if not ended:
-                    self._cancel(uid)
-
-        return ctx, token_iterator()
+        return ctx, _TokenIterator(
+            rqueue, ctx.uid, self._cancel, get_token_queue_timeout()
+        )
 
     def _cpu_preprocess(self, prompt, images=None, audio=None) -> dict:
         """CPU-only: tokenize text, load/resize images. Thread-safe."""
         add_special_tokens = (
             getattr(self.processor, "chat_template", None) is None
-            if self.model.config.model_type in ["gemma3", "gemma3n", "gemma4"]
+            if self.model.config.model_type
+            in ["gemma3", "gemma3n", "gemma4", "gemma4_unified"]
             else True
         )
         image_token_index = getattr(self.model.config, "image_token_index", None)
@@ -692,14 +885,98 @@ class ResponseGenerator:
     def _make_sampler(self, args: GenerationArguments) -> Optional[Callable]:
         if args.temperature == 0:
             return None
+        return _PositionedTargetSampler(
+            temperature=args.temperature,
+            top_p=args.top_p,
+            seed=args.seed,
+        )
 
-        def sampler(logprobs: mx.array) -> mx.array:
-            if args.top_p > 0 and args.top_p < 1.0:
-                return top_p_sampling(logprobs, args.top_p, args.temperature)
-            else:
-                return mx.random.categorical(logprobs * (1 / args.temperature))
+    def _make_logits_processors(
+        self, args: GenerationArguments, input_ids: Optional[mx.array] = None
+    ) -> List[Callable[[mx.array, mx.array], mx.array]]:
+        processors = make_logits_processors(
+            args.logit_bias,
+            args.repetition_penalty,
+            args.repetition_context_size,
+            args.presence_penalty,
+            args.presence_context_size,
+            args.frequency_penalty,
+            args.frequency_context_size,
+        )
+        if args.logits_processors is not None:
+            request_processors = args.logits_processors
+            if input_ids is not None and self._prompt_has_open_thinking(
+                args, input_ids
+            ):
+                request_processors = self._wrap_processors_until_thinking_done(
+                    args, request_processors
+                )
+            processors.extend(request_processors)
+        return processors
 
-        return sampler
+    def _thinking_token_ids(self, args: GenerationArguments) -> Tuple[int, int]:
+        tokenizer = self.tokenizer
+        thinking_start_token = args.thinking_start_token or DEFAULT_THINKING_START_TOKEN
+        thinking_end_token = args.thinking_end_token or DEFAULT_THINKING_END_TOKEN
+        thinking_start_token_id = tokenizer.encode(
+            thinking_start_token, add_special_tokens=False
+        )[-1]
+        thinking_end_token_id = tokenizer.encode(
+            thinking_end_token, add_special_tokens=False
+        )[-1]
+        return thinking_start_token_id, thinking_end_token_id
+
+    def _prompt_has_open_thinking(
+        self, args: GenerationArguments, input_ids: mx.array
+    ) -> bool:
+        if not args.enable_thinking:
+            return False
+        thinking_start_token_id, thinking_end_token_id = self._thinking_token_ids(args)
+        tokens = input_ids.flatten().tolist()
+        try:
+            last_start = len(tokens) - 1 - tokens[::-1].index(thinking_start_token_id)
+        except ValueError:
+            return False
+        try:
+            last_end = len(tokens) - 1 - tokens[::-1].index(thinking_end_token_id)
+        except ValueError:
+            last_end = -1
+        return last_start > last_end
+
+    def _wrap_processors_until_thinking_done(
+        self,
+        args: GenerationArguments,
+        processors: List[Callable[[mx.array, mx.array], mx.array]],
+    ) -> List[Callable[[mx.array, mx.array], mx.array]]:
+        thinking_start_token = args.thinking_start_token or DEFAULT_THINKING_START_TOKEN
+        thinking_end_token = args.thinking_end_token or DEFAULT_THINKING_END_TOKEN
+        return [
+            ThinkingAwareLogitsProcessor(
+                processor=processor,
+                tokenizer=self.tokenizer,
+                thinking_start_token=thinking_start_token,
+                thinking_end_token=thinking_end_token,
+                enable_thinking=True,
+            )
+            for processor in processors
+        ]
+
+    def _make_thinking_budget_criteria(
+        self, args: GenerationArguments, input_ids: mx.array
+    ) -> Optional[ThinkingBudgetCriteria]:
+        if args.thinking_budget is None:
+            return None
+        tokenizer = self.tokenizer
+        thinking_start_token = args.thinking_start_token or DEFAULT_THINKING_START_TOKEN
+        thinking_end_token = args.thinking_end_token or DEFAULT_THINKING_END_TOKEN
+        enable_thinking = self._prompt_has_open_thinking(args, input_ids)
+        return ThinkingBudgetCriteria(
+            tokenizer=tokenizer,
+            thinking_budget=args.thinking_budget,
+            thinking_end_token=thinking_end_token,
+            thinking_start_token=thinking_start_token,
+            enable_thinking=enable_thinking,
+        )
 
     def _gpu_embed(self, raw_inputs: dict, images=None) -> Tuple[mx.array, dict]:
         """GPU-only: run vision encoder if needed. Must run on GPU thread."""
@@ -787,7 +1064,7 @@ class ResponseGenerator:
 
         self._ready.set()
 
-        if self.draft_model is not None:
+        if self.draft_model is not None and self.draft_kind != "mtp":
             self._run_speculative()
             return
 
@@ -801,8 +1078,19 @@ class ResponseGenerator:
             try:
                 # Poll the request queue — non-blocking when generating, short
                 # blocking wait when idle so we don't spin.
+                active_batch = bool(active)
+                coalesce_s = (
+                    get_speculative_batch_coalesce_s()
+                    if (
+                        not active_batch
+                        and self.draft_model is not None
+                        and self.draft_kind == "mtp"
+                    )
+                    else 0.0
+                )
                 new_items, should_stop = self._collect_pending_requests(
-                    active=bool(active)
+                    active=active_batch,
+                    coalesce_s=coalesce_s,
                 )
                 if should_stop:
                     break
@@ -819,6 +1107,11 @@ class ResponseGenerator:
                             except Exception:
                                 pass
 
+                if new_items and batch_gen is not None and not active:
+                    if not batch_gen.has_work:
+                        batch_gen.close()
+                        batch_gen = None
+
                 for rqueue, raw_inputs, prompt_tokens, args, images in new_items:
                     if batch_gen is None:
                         batch_gen = BatchGenerator(
@@ -830,9 +1123,14 @@ class ResponseGenerator:
                             kv_group_size=self.kv_group_size,
                             kv_quant_scheme=self.kv_quant_scheme,
                             quantized_kv_start=self.quantized_kv_start,
-                            top_logprobs_k=self.top_logprobs_k,
+                            compute_logprobs=bool(args.logprobs),
+                            top_logprobs_k=self.top_logprobs_k if args.logprobs else 0,
                             stream=generation_stream,
                             apc_manager=self.apc_manager,
+                            draft_model=self.draft_model,
+                            draft_kind=self.draft_kind,
+                            draft_block_size=_get_draft_block_size_from_env(),
+                            greedy_sampling=args.temperature == 0,
                         )
 
                     # Vision encoder runs on the GPU thread; text tokenization
@@ -856,11 +1154,17 @@ class ResponseGenerator:
                         self._flush(batch_gen, active)
 
                     try:
+                        thinking_budget_criteria = self._make_thinking_budget_criteria(
+                            args, input_ids
+                        )
                         (uid,) = batch_gen.insert(
                             [input_ids.squeeze(0).tolist()],
                             max_tokens=args.max_tokens,
                             prompt_kwargs=[gen_kwargs],
-                            logits_processors=[args.logits_processors],
+                            logits_processors=[
+                                self._make_logits_processors(args, input_ids)
+                            ],
+                            thinking_budget_criteria=[thinking_budget_criteria],
                         )
                     except Exception as e:
                         rqueue.put(e)
@@ -875,6 +1179,7 @@ class ResponseGenerator:
                         ),
                         "gen_kwargs": gen_kwargs if has_embeds else None,
                         "prompt_tps": None,
+                        "cached_tokens": 0,
                     }
 
                 if not active or batch_gen is None:
@@ -894,6 +1199,9 @@ class ResponseGenerator:
                 batch_gen = None
                 mx.clear_cache()
                 gc.collect()
+
+        if batch_gen is not None and callable(getattr(batch_gen, "close", None)):
+            batch_gen.close()
 
     def _run_speculative(self):
         """GPU thread loop with DFlash, EAGLE-3, or MTP speculative decoding.
@@ -993,7 +1301,13 @@ class ResponseGenerator:
                     out = lm(input_mx, cache=prompt_cache, **lm_call_kwargs)
                 hidden = speculative_hidden_state(draft_kind, out)
                 shared_kv_states = out.shared_kv_states if is_mtp else None
-                first_bonus = sampler(out.logits[:, -1:]).squeeze(-1)
+                sample_row_ids = [0] * B
+                first_bonus = _sample_last_token(
+                    out.logits,
+                    sampler,
+                    row_ids=sample_row_ids,
+                    positions=[0] * B,
+                )
                 mx.eval(first_bonus, hidden, out.logits)
                 prompt_elapsed = time.perf_counter() - prompt_started
                 for uid in uids:
@@ -1021,7 +1335,7 @@ class ResponseGenerator:
                             token=tok,
                             logprobs=0.0,
                             finish_reason=finish,
-                            peak_memory=mx.get_peak_memory() / 1e9,
+                            peak_memory=mx.get_peak_memory() / 1e9 if finish else 0,
                             prompt_tps=prompt_tps_map.get(uid),
                         )
                     )
@@ -1064,6 +1378,7 @@ class ResponseGenerator:
                     shared_kv_states=shared_kv_states,
                     eos_token_ids=eos_set,
                     prompt_tokens=input_mx,
+                    row_ids=sample_row_ids,
                 )
                 for tok_list, _ in rounds_iter:
                     for j, tok in enumerate(tok_list):
@@ -1087,7 +1402,7 @@ class ResponseGenerator:
                                 token=tok,
                                 logprobs=0.0,
                                 finish_reason=finish,
-                                peak_memory=mx.get_peak_memory() / 1e9,
+                                peak_memory=mx.get_peak_memory() / 1e9 if finish else 0,
                                 prompt_tps=prompt_tps_map.get(uid),
                             )
                         )
@@ -1129,9 +1444,9 @@ class ResponseGenerator:
                 traceback.print_exc()
                 error_queues = {id(rqueue): rqueue for rqueue in rqueues.values()}
                 error_queues.update({id(rqueue): rqueue for rqueue, *_ in pending})
-                for rqueue in error_queues.values():
-                    rqueue.put(e)
-                    rqueue.put(None)
+                _notify_queues(error_queues.values(), e, None)
+                mx.clear_cache()
+                gc.collect()
 
     def _step(self, batch_gen, active, gen_kwargs=None):
         """One batch generation step: prefill + decode."""
@@ -1140,6 +1455,9 @@ class ResponseGenerator:
         for prompt_response in prompt_responses:
             if prompt_response.uid in active:
                 active[prompt_response.uid]["prompt_tps"] = prompt_response.prompt_tps
+                active[prompt_response.uid]["cached_tokens"] = getattr(
+                    prompt_response, "cached_tokens", 0
+                )
         if not responses:
             return
 
@@ -1151,10 +1469,14 @@ class ResponseGenerator:
             rqueue = info["rqueue"]
 
             tok = r.token
-            if hasattr(tok, "item"):
+            if tok is None:
+                text = info["streamer"].finalize()
+                tok = 0
+            elif hasattr(tok, "item"):
                 tok = tok.item()
-
-            text = self._stream_text(info, tok, r.finish_reason)
+                text = self._stream_text(info, tok, r.finish_reason)
+            else:
+                text = self._stream_text(info, tok, r.finish_reason)
 
             lp = r.token_logprob
 
@@ -1167,6 +1489,7 @@ class ResponseGenerator:
                     peak_memory=mx.get_peak_memory() / 1e9 if r.finish_reason else 0,
                     prompt_tps=info.get("prompt_tps"),
                     top_logprobs=getattr(r, "top_logprobs", None),
+                    cached_tokens=info.get("cached_tokens", 0),
                 )
             )
 

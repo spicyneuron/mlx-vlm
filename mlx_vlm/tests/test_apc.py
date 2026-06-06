@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import mlx.core as mx
 import numpy as np
@@ -289,6 +290,50 @@ def test_exact_batch_cache_merge_and_extract_supports_arrays_and_kv():
     _assert_allclose(extracted[1].keys, warm[1].keys)
     _assert_allclose(extracted[1].values, warm[1].values)
     assert extracted[1].offset == 12
+
+
+def test_single_row_prompt_batch_exact_checkpoint_stores_without_extract():
+    from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
+
+    from mlx_vlm.generate.ar import PromptProcessingBatch
+
+    token_ids = list(range(12))
+    arrays = ArraysCache(size=1)
+    arrays[0] = mx.ones((1, 3, 5))
+    kv = KVCache()
+    kv.keys = mx.ones((1, 1, len(token_ids), 4))
+    kv.values = mx.ones((1, 1, len(token_ids), 4)) * 2
+    kv.offset = len(token_ids)
+    rotating = RotatingKVCache(max_size=8, keep=0)
+    rotating.keys = mx.ones((1, 1, 8, 4)) * 3
+    rotating.values = mx.ones((1, 1, 8, 4)) * 4
+    rotating.offset = len(token_ids)
+    rotating._idx = 4
+
+    batch = PromptProcessingBatch.__new__(PromptProcessingBatch)
+    batch.uids = [0]
+    batch.prompt_cache = [arrays, kv, rotating]
+    batch._right_pad_per_row = None
+    batch._left_padding_per_row = [0]
+    batch._suffix_lens = [len(token_ids)]
+    batch._processed_prompt_columns = len(token_ids)
+    batch._apc_mode = "exact"
+    batch._apc_manager = APCManager(num_blocks=4, block_size=4)
+    batch._apc_meta = [
+        {
+            "full_input_ids": token_ids,
+            "prefix_len": 0,
+            "checkpoint_len": len(token_ids),
+            "extra_hash": 0,
+        }
+    ]
+
+    assert extract_prompt_cache_from_batch(batch.prompt_cache, 0) is None
+
+    batch._store_apc_exact_checkpoints()
+
+    assert batch._apc_meta[0]["checkpoint_done"] is True
+    assert batch._apc_manager.stats_snapshot()["exact_stores"] == 1
 
 
 def test_apc_max_pool_tensors_keeps_disk_persistence(tmp_path, monkeypatch):
@@ -794,3 +839,60 @@ def test_disk_metadata_mismatch_is_a_miss(tmp_path):
     assert warm is None
     assert matched_tokens == 0
     manager.close()
+
+
+def test_multimodal_token_ids_from_config():
+    config = SimpleNamespace(
+        image_token_id=None,
+        image_token_index=42,
+        video_token_id=77,
+        video_token_index=None,
+    )
+
+    assert apc_module.multimodal_token_ids_from_config(config) == {42, 77}
+
+
+def test_media_token_spans_are_contiguous_ranges():
+    token_ids = [1, 42, 42, 2, 77, 77, 77, 3]
+
+    assert apc_module.media_token_spans(token_ids, {42, 77}) == (
+        (1, 3),
+        (4, 7),
+    )
+
+
+def test_prefix_must_leave_text_only_suffix():
+    token_ids = [1, 42, 42, 2, 77, 77, 3]
+
+    assert not apc_module.prefix_leaves_text_only_suffix(token_ids, 3, {42, 77})
+    assert not apc_module.prefix_leaves_text_only_suffix(token_ids, 5, {42, 77})
+    assert apc_module.prefix_leaves_text_only_suffix(token_ids, 6, {42, 77})
+    assert apc_module.prefix_leaves_text_only_suffix(token_ids, 7, {42, 77})
+
+
+def test_adjust_prefix_moves_after_media_span():
+    token_ids = [1] + [42] * 3072 + [2] * 30
+
+    assert (
+        apc_module.adjust_prefix_to_text_suffix_boundary(
+            token_ids,
+            desired_prefix_len=2958,
+            media_token_ids={42},
+            max_prefix_tokens=len(token_ids) - 1,
+        )
+        == 3073
+    )
+
+
+def test_adjust_prefix_returns_zero_when_no_text_suffix_remains():
+    token_ids = [1, 42, 42]
+
+    assert (
+        apc_module.adjust_prefix_to_text_suffix_boundary(
+            token_ids,
+            desired_prefix_len=1,
+            media_token_ids={42},
+            max_prefix_tokens=len(token_ids) - 1,
+        )
+        == 0
+    )
