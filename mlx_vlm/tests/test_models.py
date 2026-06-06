@@ -1730,6 +1730,99 @@ class TestModels(unittest.TestCase):
             "language_model.lm_head.weight",
         )
 
+    def test_qwen3_5_moe_sanitize_accepts_stacked_split_expert_weights(self):
+        from mlx_vlm.models.qwen3_5_moe.qwen3_5_moe import Model
+
+        model = Model.__new__(Model)
+        model.config = SimpleNamespace(
+            text_config=SimpleNamespace(
+                num_hidden_layers=1,
+                num_experts=2,
+                tie_word_embeddings=False,
+            )
+        )
+
+        weights = {
+            "model.language_model.layers.0.mlp.experts.gate_proj.weight": mx.zeros(
+                (2, 4, 3)
+            ),
+            "model.language_model.layers.0.mlp.experts.up_proj.weight": mx.zeros(
+                (2, 4, 3)
+            ),
+            "model.language_model.layers.0.mlp.experts.down_proj.weight": mx.zeros(
+                (2, 3, 4)
+            ),
+        }
+
+        sanitized = model.sanitize(weights)
+
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight"
+            ].shape,
+            (2, 4, 3),
+        )
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.0.mlp.switch_mlp.up_proj.weight"
+            ].shape,
+            (2, 4, 3),
+        )
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.0.mlp.switch_mlp.down_proj.weight"
+            ].shape,
+            (2, 3, 4),
+        )
+        self.assertNotIn(
+            "language_model.model.layers.0.mlp.experts.gate_proj.weight",
+            sanitized,
+        )
+
+    def test_qwen3_5_moe_sanitize_stacks_per_expert_split_weights(self):
+        from mlx_vlm.models.qwen3_5_moe.qwen3_5_moe import Model
+
+        model = Model.__new__(Model)
+        model.config = SimpleNamespace(
+            text_config=SimpleNamespace(
+                num_hidden_layers=1,
+                num_experts=2,
+                tie_word_embeddings=False,
+            )
+        )
+
+        weights = {}
+        for expert_idx in range(2):
+            prefix = f"model.language_model.layers.0.mlp.experts.{expert_idx}"
+            weights[f"{prefix}.gate_proj.weight"] = mx.zeros((4, 3))
+            weights[f"{prefix}.up_proj.weight"] = mx.zeros((4, 3))
+            weights[f"{prefix}.down_proj.weight"] = mx.zeros((3, 4))
+
+        sanitized = model.sanitize(weights)
+
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight"
+            ].shape,
+            (2, 4, 3),
+        )
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.0.mlp.switch_mlp.up_proj.weight"
+            ].shape,
+            (2, 4, 3),
+        )
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.0.mlp.switch_mlp.down_proj.weight"
+            ].shape,
+            (2, 3, 4),
+        )
+        self.assertNotIn(
+            "language_model.model.layers.0.mlp.experts.0.gate_proj.weight",
+            sanitized,
+        )
+
     def test_qwen3_5_rotary_inv_freq_is_thread_safe(self):
         if not mx.metal.is_available():
             self.skipTest("requires Metal streams")
