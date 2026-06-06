@@ -8,7 +8,7 @@ from ....models.gemma4.config import TextConfig
 from ....models.gemma4.language import DecoderLayer
 from .config import Gemma4AssistantConfig
 from .masked_embedder import MaskedEmbedder
-from .masks import make_drafter_masks
+from .masks import make_drafter_masks, normalize_batched_shared_kv_states
 
 
 class _DraftInner(nn.Module):
@@ -27,6 +27,7 @@ class _DraftInner(nn.Module):
 
 
 class Gemma4AssistantDraftModel(nn.Module):
+    supports_greedy_draft_argmax = True
 
     def __init__(self, config: Gemma4AssistantConfig):
         super().__init__()
@@ -52,9 +53,11 @@ class Gemma4AssistantDraftModel(nn.Module):
         self._input_embed_scale: float = 1.0
         self._shared_kv: Optional[dict] = None
         self._kv_offset: int = 0
+        self._kv_valid_len = 0
         self._position: int = 0
 
         self.accept_lens: List[int] = []
+        self.draft_lens: List[int] = []
 
         if config.use_ordered_embeddings:
             self.masked_embedding = MaskedEmbedder(config)
@@ -105,8 +108,10 @@ class Gemma4AssistantDraftModel(nn.Module):
     def reset(self, target_model) -> List:
         self.bind(target_model)
         self.accept_lens = []
+        self.draft_lens = []
         self._shared_kv = None
         self._kv_offset = 0
+        self._kv_valid_len = 0
         return self.make_cache()
 
     def set_shared_kv(
@@ -114,9 +119,9 @@ class Gemma4AssistantDraftModel(nn.Module):
         shared_kv_states: dict,
         kv_offset,
         position=None,
+        kv_valid_len=None,
+        left_padding=None,
     ) -> None:
-
-        self._shared_kv = shared_kv_states
         if isinstance(kv_offset, int):
             self._kv_offset = kv_offset
         else:
@@ -125,8 +130,18 @@ class Gemma4AssistantDraftModel(nn.Module):
                 if not isinstance(kv_offset, mx.array)
                 else int(kv_offset.max().item())
             )
+        if kv_valid_len is None:
+            kv_valid_len = kv_offset
+        self._kv_valid_len = kv_valid_len
         if position is None:
             position = kv_offset
+        if left_padding is not None:
+            shared_kv_states = normalize_batched_shared_kv_states(
+                shared_kv_states,
+                kv_valid_len=kv_valid_len,
+                left_padding=left_padding,
+            )
+        self._shared_kv = shared_kv_states
         if isinstance(position, int):
             self._position = position
         elif isinstance(position, mx.array):
@@ -135,6 +150,23 @@ class Gemma4AssistantDraftModel(nn.Module):
             self._position = mx.array(position)
 
     def __call__(
+        self,
+        inputs_embeds: mx.array,
+        shared_kv_states: dict,
+        position_ids: mx.array,
+        cache: Any = None,
+    ) -> Tuple[mx.array, mx.array]:
+        last_hidden, h = self._forward_hidden(
+            inputs_embeds, shared_kv_states, position_ids, cache=cache
+        )
+        logits = (
+            self._lm_head_fn(h)
+            if self._lm_head_fn is not None
+            else (self.model.embed_tokens.as_linear(h))
+        )
+        return last_hidden, logits
+
+    def _forward_hidden(
         self,
         inputs_embeds: mx.array,
         shared_kv_states: dict,
@@ -158,6 +190,7 @@ class Gemma4AssistantDraftModel(nn.Module):
             query_offset=query_offset,
             sliding_window=text_cfg.sliding_window,
             dtype=h.dtype,
+            kv_valid_len=self._kv_valid_len,
         )
 
         if position_ids.shape[0] == 1:
@@ -179,12 +212,7 @@ class Gemma4AssistantDraftModel(nn.Module):
 
         h = self.model.norm(h)
         last_hidden = self.post_projection(h)
-        logits = (
-            self._lm_head_fn(h)
-            if self._lm_head_fn is not None
-            else (self.model.embed_tokens.as_linear(h))
-        )
-        return last_hidden, logits
+        return last_hidden, h
 
     def draft_block(
         self,
@@ -194,6 +222,7 @@ class Gemma4AssistantDraftModel(nn.Module):
         block_size: int,
         sampler,
         token_dtype: mx.Dtype = mx.int32,
+        greedy: bool = False,
     ) -> mx.array:
         """Autoregressive K-step drafting.
 
@@ -209,8 +238,13 @@ class Gemma4AssistantDraftModel(nn.Module):
         del cache
         if self._shared_kv is None:
             raise RuntimeError(
-                "set_shared_kv() must be called before draft_block(). "
-                "The round-loop in generate.py is responsible for this."
+                "Gemma 4 assistant drafter requires the MTP round-loop, but "
+                "no shared K/V was set before draft_block() — this typically "
+                "means the DFlash round-loop ran instead. Pass "
+                "--draft-kind mtp on the CLI (or MLX_VLM_DRAFT_KIND=mtp on "
+                "the server). If you call load_drafter() directly, use "
+                "kind='mtp' and pass draft_kind='mtp' through to "
+                "generate_step()."
             )
         if self._input_embed is None:
             raise RuntimeError(
@@ -234,8 +268,16 @@ class Gemma4AssistantDraftModel(nn.Module):
         for _ in range(block_size - 1):
             tok_embed = self._input_embed(tok) * self._input_embed_scale
             inputs_embeds = mx.concatenate([tok_embed, h_prev], axis=-1)
-            h_prev, logits = self(inputs_embeds, shared_kv, position_ids)
-            tok = sampler(logits)
+            if greedy and self.masked_embedding is not None:
+                h_prev, hidden = self._forward_hidden(
+                    inputs_embeds, shared_kv, position_ids
+                )
+                tok = self.masked_embedding.argmax(
+                    hidden, self.model.embed_tokens.weight
+                )
+            else:
+                h_prev, logits = self(inputs_embeds, shared_kv, position_ids)
+                tok = sampler(logits)
             tokens.append(tok)
 
         return mx.concatenate(tokens, axis=1)

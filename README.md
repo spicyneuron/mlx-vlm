@@ -37,16 +37,20 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | DeepSeek-OCR-2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr_2/README.md) |
 | DOTS-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/dots_ocr/README.md) |
 | DOTS-MOCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/dots_ocr/README.md) |
+| ERNIE 4.5 VL | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/ernie4_5_moe_vl/README.md) |
 | GLM-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/glm_ocr/README.md) |
 | Phi-4 Reasoning Vision | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/phi4_siglip/README.md) |
 | MiniCPM-o | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minicpmo/README.md) |
+| PaddleOCR-VL | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/paddleocr_vl/README.md) |
 | Phi-4 Multimodal | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/phi4mm/README.md) |
 | MolmoPoint | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/molmo_point/README.md) |
+| LocateAnything | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/locateanything/README.md) |
 | Moondream3 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/moondream3/README.md) |
 | Gemma 4 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/gemma4/README.md) |
 | Falcon-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/falcon_ocr/README.md) |
 | Granite Vision 3.2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite_vision/README.md) |
 | Granite 4.0 Vision | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite4_vision/README.md) |
+| MiniCPM-V 4.6 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minicpmv4_6/README.md) |
 
 ## Installation
 
@@ -98,14 +102,22 @@ mlx_vlm.generate --model mlx-community/Qwen3.5-2B-4bit \
 
 When the budget is exceeded, the model is forced to emit `\n</think>` and transition to the answer. If `--enable-thinking` is passed but the model's chat template does not support it, the budget is applied only if the model generates the start token on its own.
 
+On the server, thinking mode is disabled by default. Start the server with `--enable-thinking` to make thinking mode the default for requests that do not specify it:
+
+```sh
+mlx_vlm.server --model Qwen/Qwen3.5-4B --enable-thinking
+```
+
+Requests can override the server default with `enable_thinking: true` or `enable_thinking: false`.
+
 ### Speculative Decoding
 
-Speed up generation by drafting several candidate tokens with a small "drafter" model and verifying them in a single target forward pass. Two drafter families are supported.
+Speed up generation by drafting several candidate tokens with a small "drafter" model and verifying them in a single target forward pass. Three drafter families are supported.
 
 | Flag | Description |
 |------|-------------|
 | `--draft-model` | HuggingFace repo or local path for the drafter |
-| `--draft-kind` | Drafter family — `dflash` (default) or `mtp` (Gemma 4) |
+| `--draft-kind` | Drafter family — `dflash` (default), `eagle3`, or `mtp` (Gemma 4) |
 | `--draft-block-size` | Override the drafter's configured block size |
 
 See [docs/usage.md](docs/usage.md) for Python API examples including batch generation.
@@ -131,6 +143,37 @@ mlx_vlm.generate --model Qwen/Qwen3.5-4B \
 # Server with speculative decoding
 mlx_vlm.server --model Qwen/Qwen3.5-4B \
   --draft-model z-lab/Qwen3.5-4B-DFlash
+```
+
+DFlash draft-cache windowing is available from the Python API. During
+speculative decoding the target model still verifies every proposed token with
+its full KV cache; this knob only changes the DFlash drafter cache. When
+`draft_window_size` is set, the drafter keeps at most that many recent committed
+tokens in its own KV cache instead of attending over the full generated prefix.
+That reduces draft-side cache length and memory, but it can lower acceptance
+because the drafter has less context than the target verifier. On MLX, the full
+draft cache is usually faster for Qwen3.5 DFlash, so windowing defaults to
+`None`; set it only when you want to experiment with this compact recent-token
+cache tradeoff:
+
+```python
+from mlx_vlm import load
+from mlx_vlm.generate import generate
+from mlx_vlm.speculative.drafters import load_drafter
+
+model, processor = load("Qwen/Qwen3.5-4B")
+draft_model, draft_kind = load_drafter("z-lab/Qwen3.5-4B-DFlash")
+draft_model.config.draft_window_size = 256  # None disables windowing
+
+result = generate(
+    model,
+    processor,
+    "Write a quicksort in Python.",
+    max_tokens=512,
+    temperature=0,
+    draft_model=draft_model,
+    draft_kind=draft_kind,
+)
 ```
 
 #### Gemma 4 MTP
@@ -160,6 +203,21 @@ Supported pairings (target ↔ drafter):
 | `mlx-community/gemma-4-31B-it-bf16`         | `mlx-community/gemma-4-31B-it-assistant-bf16`        |
 
 Measured speedups (greedy, byte-identical output): up to **3.94×** on 26B-A4B and **2.29×** on 31B at B=4. See [`mlx_vlm/speculative/drafters/gemma4_assistant/README.md`](mlx_vlm/speculative/drafters/gemma4_assistant/README.md) for full sweeps and architecture notes.
+
+#### Gemma 4 EAGLE-3
+
+[EAGLE-3](https://sgl-project.github.io/SpecForge/concepts/EAGLE3.html) drafts from three target hidden-state captures with a lightweight one-layer speculator. The Red Hat Speculators checkpoint auto-detects as `--draft-kind eagle3`.
+
+```sh
+mlx_vlm.generate --model mlx-community/gemma-4-31B-it-bf16 \
+  --draft-model RedHatAI/gemma-4-31B-it-speculator.eagle3 \
+  --prompt "Explain speculative decoding in 3 sentences." \
+  --max-tokens 256 --temperature 0
+
+# Server
+mlx_vlm.server --model mlx-community/gemma-4-31B-it-bf16 \
+  --draft-model RedHatAI/gemma-4-31B-it-speculator.eagle3
+```
 
 ### Chat UI with Gradio
 
@@ -268,18 +326,22 @@ mlx_vlm.server --model <hf_repo_or_local_path> --adapter-path <adapter_path>
 
 # With trust remote code enabled (required for some models)
 mlx_vlm.server --trust-remote-code
+
+# Enable thinking mode by default for requests that do not override it
+mlx_vlm.server --model Qwen/Qwen3.5-4B --enable-thinking
 ```
 
 #### Server Options
 
 - `--model`: Preload a model at server startup, accepts a Hugging Face repo ID or local path (optional, loads lazily on first request if omitted)
 - `--adapter-path`: Path for adapter weights to use with the preloaded model
-- `--draft-model`: Speculative drafter path or HF id (e.g. `z-lab/Qwen3.5-4B-DFlash`, `google/gemma-4-31B-it-assistant`) — enables speculative decoding for ~2× or higher throughput
-- `--draft-kind`: Drafter family — `dflash` (default) or `mtp` (Gemma 4)
+- `--draft-model`: Speculative drafter path or HF id (e.g. `z-lab/Qwen3.5-4B-DFlash`, `RedHatAI/gemma-4-31B-it-speculator.eagle3`, `google/gemma-4-31B-it-assistant`) — enables speculative decoding for ~2× or higher throughput
+- `--draft-kind`: Drafter family — `dflash` (default), `eagle3`, or `mtp` (Gemma 4)
 - `--draft-block-size`: Override the drafter's configured block size
 - `--host`: Host address (default: `0.0.0.0`)
 - `--port`: Port number (default: `8080`)
 - `--trust-remote-code`: Trust remote code when loading models from Hugging Face Hub
+- `--enable-thinking`: Enable thinking mode by default for requests that do not set `enable_thinking`
 - `--kv-bits`: Number of bits for KV cache quantization (e.g. `8` for uniform, `3.5` for TurboQuant)
 - `--kv-quant-scheme`: KV cache quantization backend (`uniform` or `turboquant`)
 - `--kv-group-size`: Group size for uniform KV cache quantization (default: `64`)
@@ -375,24 +437,212 @@ finally:
     apc.close()
 ```
 
-To compare cold, warm-memory, and warm-disk behavior with a model:
+To compare cold, warm-memory, warm-disk, and disk-eviction behavior with a
+model, use the same direct API path:
 
-```sh
-python scripts/bench_apc_context_sweep.py \
-  --model Qwen/Qwen3-VL-4B-Instruct \
-  --contexts 8000 20000 50000 100000 \
-  --disk-cap-gb 0 \
-  --shard-max-blocks 256
-```
+```python
+import os
+import tempfile
+import time
+from pathlib import Path
 
-For a disk-eviction workload:
+from mlx_vlm import load, stream_generate
+from mlx_vlm.apc import APCManager, DiskBlockStore
+from mlx_vlm.prompt_utils import apply_chat_template
 
-```sh
-python scripts/bench_apc_disk_genstep.py \
-  --model Qwen/Qwen3-VL-4B-Instruct \
-  --test-prompt-tokens 8000 \
-  --fill-prompts 80 \
-  --disk-cap-gb 3.0
+model_id = "Qwen/Qwen3-VL-4B-Instruct"
+contexts = [8000, 20000, 50000, 100000]
+disk_cap_gb = 0  # 0 means uncapped
+shard_max_blocks = 256
+context_sweep_max_tokens = 1  # one token is enough to measure prefill reuse
+
+test_prompt_tokens = 8000
+fill_prompts = 80
+eviction_disk_cap_gb = 3.0
+
+os.environ["APC_DISK_SHARD_MAX_BLOCKS"] = str(shard_max_blocks)
+
+model, processor = load(model_id)
+tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+
+
+def disk_cap_bytes(gb: float):
+    return None if gb <= 0 else int(gb * (1 << 30))
+
+
+def make_context(target_tokens: int, seed: int = 0) -> str:
+    line = (
+        f"Document {seed}: APC benchmark content with deterministic facts, "
+        "dates, identifiers, and repeated technical notes.\n"
+    )
+    line_tokens = max(1, len(tokenizer.encode(line, add_special_tokens=False)))
+    text = line * max(1, target_tokens // line_tokens)
+    while len(tokenizer.encode(text, add_special_tokens=False)) < target_tokens:
+        text += line
+    return text
+
+
+def make_prompt(context: str, question: str) -> str:
+    return apply_chat_template(
+        processor,
+        model.config,
+        prompt=f"{context}\n\n{question}",
+        num_images=0,
+    )
+
+
+def run_once(apc: APCManager, context: str, question: str, max_tokens: int = 32):
+    prompt = make_prompt(context, question)
+    apc.reset_stats()
+
+    last = None
+    output = []
+    start = time.perf_counter()
+    for chunk in stream_generate(
+        model,
+        processor,
+        prompt,
+        max_tokens=max_tokens,
+        temperature=0.0,
+        apc_manager=apc,
+    ):
+        output.append(chunk.text)
+        last = chunk
+
+    if last is None:
+        raise RuntimeError("generation returned no chunks")
+
+    return {
+        "wall_s": time.perf_counter() - start,
+        "prompt_tokens": last.prompt_tokens,
+        "prompt_tps": last.prompt_tps,
+        "generation_tps": last.generation_tps,
+        "apc": apc.stats_snapshot(),
+        "text": "".join(output).strip(),
+    }
+
+
+def print_result(label: str, result: dict) -> None:
+    stats = result["apc"]
+    print(
+        f"{label:<12} "
+        f"prompt_tokens={result['prompt_tokens']:>7} "
+        f"prompt_tps={result['prompt_tps']:>8.1f} "
+        f"gen_tps={result['generation_tps']:>7.1f} "
+        f"matched={stats.get('matched_tokens', 0):>7} "
+        f"disk_hits={stats.get('disk_hits', 0):>5} "
+        f"disk_evictions={stats.get('disk_evictions', 0):>5}"
+    )
+
+
+def open_apc(cache_root: Path, namespace: str, disk_gb: float) -> APCManager:
+    disk = DiskBlockStore(
+        cache_root,
+        namespace=namespace,
+        max_bytes=disk_cap_bytes(disk_gb),
+    )
+    return APCManager(num_blocks=4096, block_size=16, disk=disk)
+
+
+def run_context_sweep() -> None:
+    print("cold / warm-memory / warm-disk")
+    with tempfile.TemporaryDirectory() as tmp:
+        cache_root = Path(tmp)
+        for target_tokens in contexts:
+            context = make_context(target_tokens)
+            namespace = f"{model_id}-context-{target_tokens}"
+            apc = open_apc(cache_root, namespace, disk_cap_gb)
+            try:
+                print(f"\ncontext ~= {target_tokens} text tokens")
+                print_result(
+                    "cold",
+                    run_once(
+                        apc,
+                        context,
+                        "Summarize the key decisions.",
+                        max_tokens=context_sweep_max_tokens,
+                    ),
+                )
+                print_result(
+                    "warm-memory",
+                    run_once(
+                        apc,
+                        context,
+                        "List the open engineering risks.",
+                        max_tokens=context_sweep_max_tokens,
+                    ),
+                )
+            finally:
+                # Closing waits for queued disk writes before reopening the disk tier.
+                apc.close()
+
+            apc = open_apc(cache_root, namespace, disk_cap_gb)
+            try:
+                print_result(
+                    "warm-disk",
+                    run_once(
+                        apc,
+                        context,
+                        "Extract the implementation timeline.",
+                        max_tokens=context_sweep_max_tokens,
+                    ),
+                )
+            finally:
+                apc.close()
+
+
+def run_disk_eviction_workload() -> None:
+    print("\ndisk eviction workload")
+    with tempfile.TemporaryDirectory() as tmp:
+        cache_root = Path(tmp)
+        namespace = f"{model_id}-eviction"
+        test_context = make_context(test_prompt_tokens, seed=0)
+
+        apc = open_apc(cache_root, namespace, eviction_disk_cap_gb)
+        try:
+            print_result(
+                "seed",
+                run_once(apc, test_context, "Summarize the retained test prefix."),
+            )
+        finally:
+            apc.close()
+
+        apc = open_apc(cache_root, namespace, eviction_disk_cap_gb)
+        try:
+            for i in range(fill_prompts):
+                fill_context = make_context(test_prompt_tokens, seed=i + 1)
+                run_once(
+                    apc,
+                    fill_context,
+                    f"Summarize filler document {i + 1}.",
+                    max_tokens=1,
+                )
+                if (i + 1) % 10 == 0:
+                    stats = apc.stats_snapshot()
+                    print(
+                        f"filled={i + 1:>3} "
+                        f"disk_gb={stats.get('disk_bytes', 0) / (1 << 30):.2f} "
+                        f"disk_evictions={stats.get('disk_evictions', 0)}"
+                    )
+        finally:
+            apc.close()
+
+        apc = open_apc(cache_root, namespace, eviction_disk_cap_gb)
+        try:
+            print_result(
+                "post-fill",
+                run_once(
+                    apc,
+                    test_context,
+                    "Check whether the retained test prefix still restores.",
+                ),
+            )
+        finally:
+            apc.close()
+
+
+run_context_sweep()
+run_disk_eviction_workload()
 ```
 
 #### Server
@@ -620,6 +870,7 @@ Structured outputs are not currently supported with speculative decoding.
 - `/chat/completions` and `/v1/chat/completions` - OpenAI-compatible chat-style interaction endpoint with support for images, audio, and text
 - `/responses` and `/v1/responses` - OpenAI-compatible responses endpoint
 - `/health` - Check server status
+- `/metrics` and `/v1/metrics` - Inspect rolling request metrics, throughput, and runtime counters
 - `/unload` - Unload current model from memory
 
 #### Usage Examples
@@ -749,6 +1000,9 @@ curl -X POST "http://localhost:8080/responses" \
 - `top_k`: Top-k sampling cutoff
 - `min_p`: Min-p sampling threshold
 - `repetition_penalty`: Penalty applied to repeated tokens
+- `enable_thinking`: Override the server thinking-mode default for a request (`true` or `false`)
+- `thinking_budget`: Maximum tokens allowed inside the thinking block
+- `thinking_start_token`: Token that opens a thinking block
 - `stream`: Enable streaming responses
 
 

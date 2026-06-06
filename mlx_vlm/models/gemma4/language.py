@@ -4,6 +4,7 @@ from typing import Any, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn import RMSNorm
+from mlx_lm.models.base import create_causal_mask
 
 from ..base import (
     LanguageModelOutput,
@@ -374,14 +375,20 @@ class Gemma4TextModel(nn.Module):
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.embed_scale = config.hidden_size**0.5
+        num_kv_shared = getattr(config, "num_kv_shared_layers", 0)
+        first_kv_shared = config.num_hidden_layers - num_kv_shared
         self.layers = [
-            DecoderLayer(config, layer_idx=i, kv_shared_only=kv_shared_only)
+            DecoderLayer(
+                config,
+                layer_idx=i,
+                kv_shared_only=kv_shared_only
+                or (num_kv_shared > 0 and i >= first_kv_shared),
+            )
             for i in range(config.num_hidden_layers)
         ]
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        num_kv_shared = getattr(config, "num_kv_shared_layers", 0)
-        self.first_kv_shared_layer_idx = config.num_hidden_layers - num_kv_shared
+        self.first_kv_shared_layer_idx = first_kv_shared
         self.previous_kvs = list(range(len(self.layers)))
         if num_kv_shared > 0:
             N = len(self.layers)
@@ -445,17 +452,99 @@ class Gemma4TextModel(nn.Module):
 
         return (per_layer_projection + per_layer_inputs) * self.per_layer_input_scale
 
-    def _make_masks(self, h, cache):
+    def _block_sequence_ids_for_mask(self, mm_token_type_ids: mx.array) -> mx.array:
+        is_vision = (mm_token_type_ids == 1) | (mm_token_type_ids == 2)
+        prev = mx.concatenate(
+            [
+                mx.zeros_like(is_vision[:, :1]),
+                is_vision[:, :-1],
+            ],
+            axis=1,
+        )
+        starts = is_vision & ~prev
+        group_ids = mx.cumsum(starts.astype(mx.int32), axis=1) - 1
+        return mx.where(is_vision, group_ids, mx.zeros_like(group_ids) - 1)
+
+    def _apply_blockwise_bidirectional_overlay(
+        self,
+        base_mask: mx.array,
+        mm_token_type_ids: mx.array,
+    ) -> mx.array:
+        if mm_token_type_ids is None:
+            return base_mask
+        if mm_token_type_ids.shape[1] != base_mask.shape[-1]:
+            return base_mask
+
+        block_sequence_ids = self._block_sequence_ids_for_mask(mm_token_type_ids)
+        q_blocks = mx.expand_dims(block_sequence_ids, -1)
+        k_blocks = mx.expand_dims(block_sequence_ids, -2)
+        same_block = (q_blocks != -1) & (q_blocks == k_blocks)
+        return base_mask | mx.expand_dims(same_block, 1)
+
+    def _make_masks(self, h, cache, mm_token_type_ids: Optional[mx.array] = None):
         """Create attention masks, deduplicated by layer type."""
         mask = {}
         masks = []
+        has_audio_tokens = (
+            mm_token_type_ids is not None
+            and int(mx.sum(mm_token_type_ids == 3).item()) > 0
+        )
+        has_visual_tokens = (
+            mm_token_type_ids is not None
+            and int(mx.sum((mm_token_type_ids == 1) | (mm_token_type_ids == 2)).item())
+            > 0
+        )
+        # Audio spans are sequential; keep mixed image+audio prompts causal to
+        # avoid the vision block overlay dominating quantized unified models.
+        use_bidirectional_vision = (
+            getattr(self.config, "use_bidirectional_attention", None) == "vision"
+            and mm_token_type_ids is not None
+            and has_visual_tokens
+            and not has_audio_tokens
+            and h.shape[1] > 1
+        )
         for l, c in zip(self.layers, cache):
             if l.layer_type not in mask:
                 if l.layer_type == "full_attention":
-                    mask["full_attention"] = create_attention_mask(h, c)
+                    # Full attention can use MLX's causal mask even when
+                    # prefilling against an existing KV prefix. Only materialize
+                    # a mask for batch left-padding or the Gemma 4 vision
+                    # bidirectional overlay.
+                    return_array = (
+                        use_bidirectional_vision
+                        or getattr(c, "left_padding", None) is not None
+                    )
+                    mask["full_attention"] = create_attention_mask(
+                        h, c, return_array=return_array
+                    )
                 elif l.layer_type == "sliding_attention":
+                    return_array = (
+                        h.shape[1] > 1
+                        and c is not None
+                        and int(mx.max(mx.array(c.offset)).item()) > 0
+                    ) or use_bidirectional_vision
                     mask["sliding_attention"] = create_attention_mask(
-                        h, c, window_size=self.window_size
+                        h, c, window_size=self.window_size, return_array=return_array
+                    )
+                if (
+                    use_bidirectional_vision
+                    and isinstance(mask[l.layer_type], str)
+                    and mask[l.layer_type] == "causal"
+                ):
+                    window = (
+                        self.window_size
+                        if l.layer_type == "sliding_attention"
+                        else None
+                    )
+                    mask[l.layer_type] = create_causal_mask(
+                        h.shape[1], window_size=window
+                    )
+                if use_bidirectional_vision and isinstance(
+                    mask[l.layer_type], mx.array
+                ):
+                    mask[l.layer_type] = self._apply_blockwise_bidirectional_overlay(
+                        mask[l.layer_type],
+                        mm_token_type_ids,
                     )
             masks.append(mask[l.layer_type])
         return masks
@@ -467,6 +556,8 @@ class Gemma4TextModel(nn.Module):
         mask: Optional[mx.array] = None,
         cache=None,
         per_layer_inputs: Optional[mx.array] = None,
+        mm_token_type_ids: Optional[mx.array] = None,
+        token_type_ids: Optional[mx.array] = None,
         capture_layer_ids: Optional[List[int]] = None,
         hidden_sink: Optional[list] = None,
         shared_kv_sink: Optional[dict] = None,
@@ -506,7 +597,9 @@ class Gemma4TextModel(nn.Module):
             cache = cache + [None] * (len(self.layers) - len(cache))
 
         if mask is None:
-            masks = self._make_masks(h, cache)
+            if mm_token_type_ids is None:
+                mm_token_type_ids = token_type_ids
+            masks = self._make_masks(h, cache, mm_token_type_ids)
         else:
             masks = [mask] * len(self.layers)
 
@@ -545,10 +638,14 @@ class Gemma4TextModel(nn.Module):
 
         # Match HF's `_can_record_outputs={"hidden_states": Gemma4TextDecoderLayer}`
         # — the recorded value is the LAST decoder layer's output, captured
-        # BEFORE the final RMSNorm. The drafter's `pre_projection` was trained
-        # against this pre-norm hidden.
+        # BEFORE the final RMSNorm. Speculative verification can reuse this
+        # hidden for deferred logits; MTP drafters normalize it via
+        # LanguageModel.speculative_draft_hidden before consuming it.
         if hidden_sink is not None and not capture_set:
             hidden_sink.append(h)
+
+        if kwargs.pop("skip_final_norm", False):
+            return h
 
         h = self.norm(h)
 
@@ -562,6 +659,54 @@ class LanguageModel(nn.Module):
         self.model_type = config.model_type
         self.model = Gemma4TextModel(config)
         self.final_logit_softcapping = getattr(config, "final_logit_softcapping", None)
+
+    def logits_from_hidden(self, hidden: mx.array) -> mx.array:
+        logits = self.model.embed_tokens.as_linear(hidden)
+        if self.final_logit_softcapping is not None:
+            logits = logit_softcap(self.final_logit_softcapping, logits)
+        return logits
+
+    def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
+        return self.logits_from_hidden(self.model.norm(hidden))
+
+    def speculative_draft_hidden(self, hidden: mx.array) -> mx.array:
+        return self.model.norm(hidden)
+
+    def chunked_prefill_policy(
+        self,
+        *,
+        input_ids=None,
+        inputs_embeds=None,
+        prompt_cache=None,
+        draft_model=None,
+        draft_kind=None,
+        prefill_kwargs=None,
+    ) -> bool:
+        del input_ids, inputs_embeds, prompt_cache
+        prefill_kwargs = prefill_kwargs or {}
+        if getattr(self, "no_chunked_prefill", False):
+            return False
+
+        token_types = prefill_kwargs.get("mm_token_type_ids", None)
+        if token_types is None:
+            token_types = prefill_kwargs.get("token_type_ids", None)
+        if (
+            getattr(self.config, "use_bidirectional_attention", None) == "vision"
+            and token_types is not None
+        ):
+            has_visual = int(mx.sum((token_types == 1) | (token_types == 2)).item()) > 0
+            has_audio = int(mx.sum(token_types == 3).item()) > 0
+            if has_visual and not has_audio:
+                return False
+
+        if draft_model is not None:
+            return (
+                draft_kind == "mtp"
+                and bool(prefill_kwargs.get("return_hidden", False))
+                and bool(prefill_kwargs.get("return_shared_kv", False))
+            )
+
+        return True
 
     def __call__(
         self,
@@ -596,9 +741,7 @@ class LanguageModel(nn.Module):
             shared_kv_sink=shared_kv_sink,
             **kwargs,
         )
-        out = self.model.embed_tokens.as_linear(out)
-        if self.final_logit_softcapping is not None:
-            out = logit_softcap(self.final_logit_softcapping, out)
+        out = self.logits_from_hidden(out)
         return LanguageModelOutput(
             logits=out,
             hidden_states=hidden_sink,
@@ -621,6 +764,8 @@ class LanguageModel(nn.Module):
         del gdn_states  # API-parity placeholder; Gemma 4 has no SSM/GDN state.
         if isinstance(accepted, int):
             accepted = mx.array([accepted])
+        if isinstance(accepted, (list, tuple)):
+            accepted = mx.array(accepted, dtype=mx.int32)
 
         max_a = int(accepted.max().item())
         n = max_a + 1
@@ -629,9 +774,10 @@ class LanguageModel(nn.Module):
         valid_ends = accepted + 1
 
         for c in caches:
-            if c is None or not c.is_trimmable():
+            if c is None:
                 continue
-            if trim > 0:
+
+            if trim > 0 and hasattr(c, "trim"):
                 c.trim(trim)
             if is_batch and hasattr(c, "_idx") and c.keys is not None and max_a > 0:
                 kv_len = c._idx
@@ -649,6 +795,8 @@ class LanguageModel(nn.Module):
         for k, v in weights.items():
             if "self_attn.rotary_emb" in k:
                 continue
+            if self._is_unused_shared_kv_weight(k):
+                continue
             if any(
                 s in k for s in ["input_max", "input_min", "output_max", "output_min"]
             ):
@@ -656,6 +804,28 @@ class LanguageModel(nn.Module):
                     continue
             sanitized[k] = v
         return sanitized
+
+    def _is_unused_shared_kv_weight(self, key: str) -> bool:
+        prefix = "language_model.model.layers."
+        if not key.startswith(prefix):
+            return False
+
+        parts = key[len(prefix) :].split(".")
+        if len(parts) < 4 or parts[1] != "self_attn":
+            return False
+
+        try:
+            layer_idx = int(parts[0])
+        except ValueError:
+            return False
+        if layer_idx >= len(self.model.layers):
+            return False
+
+        attn = self.model.layers[layer_idx].self_attn
+        if not getattr(attn, "is_kv_shared_layer", False):
+            return False
+
+        return parts[2] in {"k_proj", "v_proj", "k_norm", "v_norm"}
 
     @property
     def layers(self):
@@ -675,8 +845,6 @@ class LanguageModel(nn.Module):
             if not hasattr(m, "to_quantized"):
                 return False
             if "router" in path:
-                return {"group_size": 64, "bits": 8}
-            if path.endswith(("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")):
                 return {"group_size": 64, "bits": 8}
             return True
 
